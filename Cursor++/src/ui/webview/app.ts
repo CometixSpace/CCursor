@@ -810,6 +810,18 @@ export function initApp(Alpine: AlpineType) {
       return this.validate(pid).modelErrors[mid] || {}
     },
 
+    /**
+     * 模型计数 "激活/总数" (供模板使用, 避免长表达式)。
+     *
+     * "激活" 的口径与 model-card 上的开关一致 (defaultOn === true),
+     * 也就是真正会注册进 Cursor 模型选择器的那些。
+     */
+    modelCountLabel(pid: string): string {
+      const models = this.getProviderView(pid).models || []
+      const on = models.filter((m: any) => m.defaultOn === true).length
+      return `${on}/${models.length}`
+    },
+
     fmtCtx(n: number): string {
       if (n >= 1_000_000) {
         const v = n / 1_000_000
