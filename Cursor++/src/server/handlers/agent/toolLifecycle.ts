@@ -19,19 +19,35 @@ const IMAGE_EXTENSIONS: Record<string, string> = {
 
 const MAX_IMAGE_SIZE = 10 * 1024 * 1024; // 10 MB
 
-function extractReadImageBlock(cursorToolType: string, toolResult: ToolResultEnvelope, input: Record<string, unknown>): Extract<LLMContentBlock, { type: 'image' }> | null {
-    if (cursorToolType !== 'readToolCall') return null;
+function buildImageBlock(data: unknown, mimeType: string): Extract<LLMContentBlock, { type: 'image' }> | null {
+    if (!(data instanceof Uint8Array) || data.length === 0 || data.length > MAX_IMAGE_SIZE || !mimeType) return null;
+    return { type: 'image', mimeType, data: Buffer.from(data).toString('base64') };
+}
+
+function extractToolImageBlock(cursorToolType: string, toolResult: ToolResultEnvelope, input: Record<string, unknown>): Extract<LLMContentBlock, { type: 'image' }> | null {
     const value = toolResult.result?.value as Record<string, unknown> | undefined;
     if (!value || toolResult.result?.case !== 'success') return null;
+
+    if (cursorToolType === 'mcpToolCall') {
+        const contentItems = Array.isArray(value.content) ? value.content as Array<Record<string, unknown>> : [];
+        for (const contentItem of contentItems) {
+            const content = contentItem.content as { case?: string; value?: unknown } | undefined;
+            if (content?.case !== 'image' || !content.value || typeof content.value !== 'object') continue;
+            const imageValue = content.value as Record<string, unknown>;
+            const imageBlock = buildImageBlock(imageValue.data, String(imageValue.mimeType ?? ''));
+            if (imageBlock) return imageBlock;
+        }
+        return null;
+    }
+
+    if (cursorToolType !== 'readToolCall') return null;
     const output = value.output as { case: string; value: unknown } | undefined;
     if (output?.case !== 'data' || !(output.value instanceof Uint8Array)) return null;
     const bytes = output.value as Uint8Array;
-    if (bytes.length === 0 || bytes.length > MAX_IMAGE_SIZE) return null;
     const path = String(value.path ?? input.path ?? '');
     const ext = path.slice(path.lastIndexOf('.')).toLowerCase();
     const mimeType = IMAGE_EXTENSIONS[ext];
-    if (!mimeType) return null;
-    return { type: 'image', mimeType, data: Buffer.from(bytes).toString('base64') };
+    return buildImageBlock(bytes, mimeType);
 }
 
 export function finalizeToolCall(params: {
@@ -118,6 +134,6 @@ export function finalizeToolCall(params: {
             toolResult,
             params.modelCallId,
         ),
-        imageBlock: extractReadImageBlock(params.cursorToolType, toolResult, params.input),
+        imageBlock: extractToolImageBlock(params.cursorToolType, toolResult, params.input),
     };
 }

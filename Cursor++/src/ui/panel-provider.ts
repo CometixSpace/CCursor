@@ -17,7 +17,7 @@ import { join } from 'node:path'
 import * as vscode from 'vscode'
 import { bumpRefreshSignal } from '../server'
 import { searchCatalog } from '../server/config/catalogStore'
-import { updateProviders } from '../server/config/providersStore'
+import { lookupModel, updateProviders } from '../server/config/providersStore'
 import { resetProviderInstanceCache } from '../server/handlers/llm/providerRuntime'
 import { renderHtml } from './components/layout'
 import { getState, onStateChange, refreshState } from './state'
@@ -168,6 +168,35 @@ export class PanelProvider implements vscode.WebviewViewProvider {
           catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err)
             this.view?.webview.postMessage({ type: 'toast', text: `Save search config failed: ${errMsg}`, level: 'error', duration: 6000 })
+          }
+          break
+        }
+        case 'saveVisionModel': {
+          const visionModelId = typeof msg.modelId === 'string' ? msg.modelId.trim() : ''
+          try {
+            if (visionModelId) {
+              const resolved = lookupModel(visionModelId)
+              if (!resolved)
+                throw new Error(`Model "${visionModelId}" is not registered`)
+              if (resolved.model.supportsImages === false)
+                throw new Error(`Model "${visionModelId}" does not support images`)
+              if (resolved.model.supportsAgent === false)
+                throw new Error(`Model "${visionModelId}" does not support Agent mode`)
+            }
+            await updateProviders((draft) => {
+              draft.visionModelId = visionModelId
+            })
+            const state = await refreshState()
+            this.postState()
+            this.view?.webview.postMessage({
+              type: 'visionModelSaved',
+              state,
+              text: visionModelId ? 'Vision model saved.' : 'Vision routing disabled.',
+            })
+          }
+          catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            this.view?.webview.postMessage({ type: 'visionModelSaveFailed', error: errMsg })
           }
           break
         }

@@ -27,6 +27,7 @@ import { isAgentRunAbortedError, throwIfSessionCancelled } from './wait'
 import { isSessionCancelled } from './session'
 import { makeProviderError, makeToolError } from '../errors'
 import { createRepairDiagnostics, hasRepairMutations, repairConversationHistory } from '../llm/transformMessages'
+import { omitImagesForTextOnlyModel, selectRoundModel } from './visionRouting'
 
 const LEADING_DASH_RE = /^-\s*/
 
@@ -970,10 +971,11 @@ export async function* handleConversationRun(
   )
   let lastAssistantContent: LLMContentBlock[] | undefined
   let stepCounter = 0
+  let hasNewImagesForNextRound = currentUserImageCount > 0
 
   for (let round = 0; ; round++) {
     // 轮次边界的中断检查 —— 上一轮工具刚跑完时客户端可能已经中断,
-    // 此处拦下可避免白发一次 LLM 请求
+    // 此处拦下可避免白发一次 LLM 请求和不必要的模型路由。
     if (session && isSessionCancelled(session)) {
       logger.info({
         conversationId: parsed.conversationId,
@@ -982,6 +984,34 @@ export async function* handleConversationRun(
       }, '[CANCEL] run cancelled at round boundary')
       return
     }
+
+    const roundModelSelection = selectRoundModel(parsed.modelId, hasNewImagesForNextRound)
+    const roundRoute = roundModelSelection.modelId === parsed.modelId
+      ? route
+      : resolveProviderRuntime(roundModelSelection.modelId)
+    const roundMessages = roundModelSelection.supportsImages
+      ? messages
+      : omitImagesForTextOnlyModel(messages)
+    const roundContextualizedBuiltinTools = roundModelSelection.switchedToVisionModel
+      ? contextualizeSubagentTools(roundRoute.toolCatalog.listBuiltins(), parsed.customSubagents)
+      : contextualizedBuiltinTools
+    const roundRuntimeBuiltinTools = roundModelSelection.switchedToVisionModel
+      ? contextualizeDynamicMetaTools(roundContextualizedBuiltinTools, parsed.cursorDynamicTools)
+      : runtimeBuiltinTools
+    const roundContextTokenLimit = roundModelSelection.switchedToVisionModel
+      ? roundRoute.contextTokenLimit
+      : contextTokenLimit
+
+    if (roundModelSelection.switchedToVisionModel) {
+      logger.info({
+        round,
+        mainModelId: parsed.modelId,
+        visionModelId: roundModelSelection.modelId,
+      }, '[VISION] image input detected — routing round to vision model')
+    }
+
+    // 当前图片批次只触发一个看图轮；工具在本轮产生新截图时会在轮末重新置 true。
+    hasNewImagesForNextRound = false
 
     const pendingToolCalls: ToolCallInfo[] = []
     const inflightToolCalls = new Map<string, { name: string, input: string }>()
@@ -998,14 +1028,26 @@ export async function* handleConversationRun(
       // 客户端只发 slim 名单(仅 toolName,无 inputSchema),摊平下发等于给 LLM
       // 一堆没有参数说明的工具。见 analysis/mcp-dynamic-tools.md。
       const llmVisibleMcpTools = parsed.mcpMetaTool?.enabled ? [] : parsed.mcpTools
-      const preparedRequest = route.prepareStreamRequest(messages, llmVisibleMcpTools, undefined, parsed.mode, {
-        thinking: parsed.clientThinking,
-        level: parsed.clientThinkingLevel,
-        budget: parsed.clientThinkingBudget,
-      }, parsed.conversationId, parsed.isSubagent, parsed.clientFast,
-      disabledToolsForRun.size > 0 ? disabledToolsForRun : undefined,
-      contextTokenLimit,
-      runtimeBuiltinTools)
+      const roundThinkingOverride = roundModelSelection.switchedToVisionModel
+        ? undefined
+        : {
+            thinking: parsed.clientThinking,
+            level: parsed.clientThinkingLevel,
+            budget: parsed.clientThinkingBudget,
+          }
+      const preparedRequest = roundRoute.prepareStreamRequest(
+        roundMessages,
+        llmVisibleMcpTools,
+        undefined,
+        parsed.mode,
+        roundThinkingOverride,
+        parsed.conversationId,
+        parsed.isSubagent,
+        roundModelSelection.switchedToVisionModel ? undefined : parsed.clientFast,
+        disabledToolsForRun.size > 0 ? disabledToolsForRun : undefined,
+        roundContextTokenLimit,
+        roundRuntimeBuiltinTools,
+      )
 
       if (!breakdownCategories) {
         breakdownCategories = buildContextBreakdown({
@@ -1021,11 +1063,13 @@ export async function* handleConversationRun(
 
       logger.info({
         round,
-        codec: route.conversationCodec.name,
+        modelId: roundModelSelection.modelId,
+        visionRouted: roundModelSelection.switchedToVisionModel,
+        codec: roundRoute.conversationCodec.name,
         semanticTurns: preparedRequest.conversation.semanticTurns.map(turn => turn.kind),
-        toolCatalogProvider: route.toolCatalog.provider,
-        toolCatalogVariant: route.toolCatalog.variant,
-        builtinsCount: route.toolCatalog.listBuiltins().length,
+        toolCatalogProvider: roundRoute.toolCatalog.provider,
+        toolCatalogVariant: roundRoute.toolCatalog.variant,
+        builtinsCount: roundRoute.toolCatalog.listBuiltins().length,
         runtimeToolsCount: preparedRequest.request.tools?.length ?? 0,
         // 路由表规模 vs 实际下发给 LLM 的规模 — meta 模式下后者恒为 0
         mcpToolsCount: parsed.mcpTools.length,
@@ -1034,7 +1078,7 @@ export async function* handleConversationRun(
         llmVisibleMcpToolsCount: llmVisibleMcpTools.length,
       }, '[AGENT] prepared provider conversation')
 
-      const llmStream = route.provider.stream(preparedRequest.request)
+      const llmStream = roundRoute.provider.stream(preparedRequest.request)
 
       const translatedFrames = translateStream(llmStream, String(++stepCounter), (event) => {
         switch (event.type) {
@@ -1043,7 +1087,7 @@ export async function* handleConversationRun(
             break
           case 'thinking_done':
             // 即使 currentThinking 为空也要保存 — DeepSeek 要求空 reasoning_content 原样回传
-            roundAssistantBlocks.push({ type: 'thinking', text: currentThinking, signature: event.signature, sourceModel: `${route.promptProfile.provider}:${route.model}` })
+            roundAssistantBlocks.push({ type: 'thinking', text: currentThinking, signature: event.signature, sourceModel: `${roundRoute.promptProfile.provider}:${roundRoute.model}` })
             currentThinking = ''
             break
           case 'text_delta':
@@ -1195,13 +1239,14 @@ export async function* handleConversationRun(
       clearDraftCheckpoint(parsed.conversationId).catch(() => {})
       throw makeProviderError(e, {
         conversationId: parsed.conversationId,
-        modelId: parsed.modelId,
+        modelId: roundModelSelection.modelId,
+        visionRouted: roundModelSelection.switchedToVisionModel ? 'true' : 'false',
         round: String(round),
       })
     }
 
     if (pendingToolCalls.length === 0) {
-      const transition = route.transitionRound(messages, roundAssistantBlocks)
+      const transition = roundRoute.transitionRound(messages, roundAssistantBlocks)
       if (transition.assistantAdded) {
         lastAssistantContent = roundAssistantBlocks
         const turnBlobs = recordAssistantBlocksIntoTurn(activeTurn, roundAssistantBlocks)
@@ -1220,7 +1265,7 @@ export async function* handleConversationRun(
       for (const blob of turnBlobs)
         yield cacheAndBuildKvBlob(++blobCounter, blob)
 
-      const roundContext = route.createRoundContext()
+      const roundContext = roundRoute.createRoundContext()
       const roundImageBlocks: LLMContentBlock[] = []
 
       // ── Phase 1: 批量发送 Task tool 的 started + exec（不等待结果） ──
@@ -1322,7 +1367,7 @@ export async function* handleConversationRun(
       if (roundContext.pendingToolResults.length > 0) {
         logger.info({
           round,
-          stateStrategy: route.stateStrategy.name,
+          stateStrategy: roundRoute.stateStrategy.name,
           toolResults: roundContext.pendingToolResults.map(block => ({
             toolUseId: block.toolUseId,
             isError: !!block.isError,
@@ -1335,7 +1380,8 @@ export async function* handleConversationRun(
 
       if (roundImageBlocks.length > 0) {
         messages.push({ role: 'user', content: roundImageBlocks })
-        logger.info({ count: roundImageBlocks.length }, '[AGENT] injected image blocks from Read tool results')
+        hasNewImagesForNextRound = true
+        logger.info({ count: roundImageBlocks.length }, '[AGENT] injected image blocks from tool results')
       }
 
       ({ nextIndex: nextBlobbedMessageIndex, blobCounter } = yield* flushMessageBlobs(

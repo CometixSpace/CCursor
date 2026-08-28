@@ -252,6 +252,8 @@ export interface ProviderEntry {
 
 export interface ProvidersConfig {
   $schemaVersion: number
+  /** 主模型不支持图片时，本轮临时使用的多模态 Agent 模型 ID */
+  visionModelId?: string
   providers: ProviderEntry[]
 }
 
@@ -263,6 +265,7 @@ export interface ProvidersConfig {
  */
 export const DEFAULT_PROVIDERS: ProvidersConfig = {
   $schemaVersion: 1,
+  visionModelId: '',
   providers: [],
 }
 
