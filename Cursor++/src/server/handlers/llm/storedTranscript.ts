@@ -21,6 +21,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object'
 }
 
+/**
+ * providerOptions 白名单过滤: 只透传 cursor.isSummary 摘要标记 (设计文档 §6 Q6)。
+ *
+ * 语义: blob 里只允许携带这一项元数据 —— 它是官方 CC-010 的尾部保留判定依据,
+ * 丢失会导致旧摘要被当普通历史重复进摘要源/重复归档 (地板爬升根因之二);
+ * 其余 provider 选项不落盘, 避免无限膨胀的透传面。
+ */
+export function filterSummaryProviderOptions(providerOptions: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!isRecord(providerOptions))
+    return undefined
+  const cursor = providerOptions.cursor
+  if (!isRecord(cursor) || cursor.isSummary !== true)
+    return undefined
+  return { cursor: { isSummary: true } }
+}
+
 export function normalizeStoredMessage(message: {
   role: string
   content: unknown
@@ -38,7 +54,7 @@ export function normalizeStoredMessage(message: {
       toolName: message.toolName,
       isError: message.isError,
       id: message.id,
-      providerOptions: message.providerOptions,
+      providerOptions: filterSummaryProviderOptions(message.providerOptions),
     }
   }
 
@@ -113,7 +129,7 @@ export function normalizeStoredMessage(message: {
     toolName: message.toolName,
     isError: message.isError,
     id: message.id,
-    providerOptions: message.providerOptions,
+    providerOptions: filterSummaryProviderOptions(message.providerOptions),
   }
 }
 
@@ -129,7 +145,7 @@ export function restoreStoredMessage(message: Record<string, unknown>): StoredMe
       toolName: typeof message.toolName === 'string' ? message.toolName : undefined,
       isError: typeof message.isError === 'boolean' ? message.isError : undefined,
       id: typeof message.id === 'string' ? message.id : undefined,
-      providerOptions: isRecord(message.providerOptions) ? message.providerOptions : undefined,
+      providerOptions: filterSummaryProviderOptions(isRecord(message.providerOptions) ? message.providerOptions : undefined),
     }
   }
 
@@ -204,7 +220,7 @@ export function restoreStoredMessage(message: Record<string, unknown>): StoredMe
     toolName: typeof message.toolName === 'string' ? message.toolName : undefined,
     isError: typeof message.isError === 'boolean' ? message.isError : undefined,
     id: typeof message.id === 'string' ? message.id : undefined,
-    providerOptions: isRecord(message.providerOptions) ? message.providerOptions : undefined,
+    providerOptions: filterSummaryProviderOptions(isRecord(message.providerOptions) ? message.providerOptions : undefined),
   }
 }
 
@@ -216,6 +232,7 @@ export function storedMessageToLLMMessage(message: StoredMessage): LLMMessage {
       toolCallId: message.toolCallId,
       toolName: message.toolName,
       isError: message.isError,
+      providerOptions: filterSummaryProviderOptions(message.providerOptions),
     }
   }
 
@@ -257,6 +274,7 @@ export function storedMessageToLLMMessage(message: StoredMessage): LLMMessage {
     toolCallId: message.toolCallId,
     toolName: message.toolName,
     isError: message.isError,
+    providerOptions: filterSummaryProviderOptions(message.providerOptions),
   }
 }
 
@@ -268,6 +286,7 @@ export function llmMessageToStoredMessage(message: LLMMessage): StoredMessage {
       toolCallId: message.toolCallId,
       toolName: message.toolName,
       isError: message.isError,
+      providerOptions: filterSummaryProviderOptions(message.providerOptions),
     }
   }
 
@@ -309,5 +328,6 @@ export function llmMessageToStoredMessage(message: LLMMessage): StoredMessage {
     toolCallId: message.toolCallId,
     toolName: message.toolName,
     isError: message.isError,
+    providerOptions: filterSummaryProviderOptions(message.providerOptions),
   }
 }

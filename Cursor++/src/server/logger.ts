@@ -22,9 +22,6 @@ import { Writable } from 'node:stream'
 import pino from 'pino'
 import { getLogsDir } from './config/paths'
 
-export const LOG_FILE = '(embedded)'
-export const STREAM_LOG_FILE = '(embedded)'
-
 /** 日志级别字符串 — 与 LogOutputChannel 方法名对齐 */
 export type LogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error'
 
@@ -75,11 +72,6 @@ interface LogContext {
   windowId: number
 }
 const als = new AsyncLocalStorage<LogContext>()
-
-/** 绑定请求的 windowId 上下文 (包裹模式), 内部所有 logger 调用都会关联到该窗口 */
-export function withWindowId<T>(windowId: number, fn: () => T): T {
-  return als.run({ windowId }, fn)
-}
 
 /**
  * 同步进入 windowId 上下文 (适用于 Fastify onRequest hook).

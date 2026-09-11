@@ -5,3 +5,5 @@ export type { LLMProvider, LLMStreamRequest, LLMStreamEvent, LLMMessage, LLMTool
 export type { ProviderRuntime, PreparedProviderConversation } from './providerRuntime';
 export { routeModel } from './router';
 export { resolveProviderRuntime } from './providerRuntime';
+export type { ProviderRequestLifecycle } from './requestLifecycle';
+export { createProviderRequestLifecycle, withProviderRequestLifecycle } from './requestLifecycle';

@@ -1,5 +1,6 @@
 import type { LogEntry, LogLevel } from './logger'
 import type { RuntimeConfigInit } from './runtime-config'
+import { readFileSync } from 'node:fs'
 import { fastifyConnectPlugin } from '@connectrpc/connect-fastify'
 import cors from '@fastify/cors'
 /**
@@ -11,6 +12,7 @@ import Fastify from 'fastify'
 import { ensureProvidersFile } from './config/providersStore'
 import { ensureRoutesFile, loadRoutes, toggleByokMode } from './config/routesStore'
 import { closeAgentDatabase, initDatabase } from './database/sqlite'
+import { queryUsageStats, resolveUsageRangeSinceDay } from './database/usageStats'
 import { enterWindowContext, logger, setLogBroadcast, setLogPush, setLogSubscriberCheck } from './logger'
 import { initRuntimeConfig } from './runtime-config'
 import routes from './services'
@@ -31,6 +33,10 @@ const TRACE_PATHS = new Set([
 ])
 
 let app: any = null
+
+// 浏览器版 Dashboard 脚本缓存 — dashboardJsPath 首次成功读取后驻留,
+// 后续请求零 IO (路径随扩展安装固定, 进程内不会变)
+let cachedBrowserDashboardJs: string | null = null
 
 // ── SSE 日志分发 (per-windowId) ──
 //
@@ -104,6 +110,12 @@ function resolveWindowId(req: any): number | null {
  */
 const refreshEventStreams = new Set<any>()
 
+/**
+ * ext host SSE 订阅集合 (/byok/ext-events) — 与 renderer 的 /byok/events 分开,
+ * renderer→ext host 桥接命令 (openUsagePage 等) 的 dispatched 计数才有意义
+ */
+const extEventStreams = new Set<any>()
+
 let refreshDebounceTimer: ReturnType<typeof setTimeout> | null = null
 
 export function bumpRefreshSignal(): void {
@@ -149,7 +161,18 @@ export function pushRoutesUpdate(restPaths: string[]): void {
   logger.info({ connections: sent, restPaths: restPaths.length }, '[SRV] routes update pushed')
 }
 
-export interface StartServerOptions extends RuntimeConfigInit {}
+export interface StartServerOptions extends RuntimeConfigInit {
+  /**
+   * 浏览器版 Usage Dashboard 页面 — Agents Window (glass) 入口在系统浏览器打开。
+   * 未配置时 /byok/usage 返回 503、/byok/usage.js 返回 404。
+   */
+  usageDashboardPage?: {
+    /** renderDashboardPageHtml({ scriptSrc, includeBrowserThemeDefaults: true }) 产物 */
+    html: string
+    /** dist/dashboard.js 绝对路径 (server 伺服, 模块级缓存一次) */
+    dashboardJsPath: string
+  }
+}
 
 export async function startServer(opts: StartServerOptions): Promise<{ host: string, port: number }> {
   if (app) {
@@ -295,6 +318,81 @@ export async function startServer(opts: StartServerOptions): Promise<{ host: str
 
   // Fake auth endpoints
   server.get('/health', async () => ({ ok: true, mode: 'byok' }))
+
+  // 每模型 Token 用量统计 — Dashboard 查询端点。
+  // server 只查表输出原始行, 聚合计算全部交给前端。
+  // range→sinceDay 换算在 resolveUsageRangeSinceDay 内用本地时区完成。
+  server.get('/byok/usage-stats', async (req) => {
+    const requestedRange = String((req.query as any).range ?? '7d')
+    const effectiveRange = ['today', '7d', '30d', 'all'].includes(requestedRange) ? requestedRange : '7d'
+    const sinceDay = resolveUsageRangeSinceDay(effectiveRange)
+    const rows = await queryUsageStats(sinceDay)
+    return { ok: true, generatedAt: Date.now(), rows }
+  })
+
+  // ── 浏览器版 Usage Dashboard 页面 (Agents Window 入口在系统浏览器打开) ──
+  // 页面本身静态伺服, 取数走同源 /byok/usage-stats (browser transport)。
+
+  server.get('/byok/usage', async (_req, reply) => {
+    if (!opts.usageDashboardPage) {
+      reply.code(503).type('text/plain').send('Usage dashboard page not configured — start the BYOK server from the Cursor++ extension.')
+      return
+    }
+    reply.type('text/html').send(opts.usageDashboardPage.html)
+  })
+
+  server.get('/byok/usage.js', async (_req, reply) => {
+    if (!opts.usageDashboardPage) {
+      reply.code(404).send({ error: 'usage dashboard not configured' })
+      return
+    }
+    if (cachedBrowserDashboardJs === null) {
+      try {
+        cachedBrowserDashboardJs = readFileSync(opts.usageDashboardPage.dashboardJsPath, 'utf-8')
+      }
+      catch (err) {
+        logger.warn({ error: (err as Error).message }, '[SRV] dashboard.js read failed')
+        reply.code(404).send({ error: 'dashboard.js not found' })
+        return
+      }
+    }
+    reply.type('text/javascript').send(cachedBrowserDashboardJs)
+  })
+
+  // ── renderer → ext host 桥接通道 ──
+  //
+  // Agents Window 的注入按钮跑在 renderer, 无扩展进程直连; 经此 SSE 通道把
+  // "打开浏览器页" 这类需要 vscode.commands 的动作转发给订阅的 ext host。
+
+  // ext host SSE 订阅 — 桥接命令广播 (照 /byok/events 模式)
+  server.get('/byok/ext-events', async (req, reply) => {
+    extEventStreams.add(reply)
+    reply.raw.writeHead(200, sseHeaders)
+    reply.raw.write(`: connected\n\n`)
+    reply.hijack()
+
+    req.raw.on('close', () => {
+      extEventStreams.delete(reply)
+    })
+  })
+
+  // glassStatus 卡片「Open Usage Dashboard」点击 → 广播给全部 ext host,
+  // 由聚焦窗口的扩展执行 glass.openBrowserTab (内置浏览器)
+  server.post('/byok/open-usage', async () => {
+    const url = `http://${host}:${port}/byok/usage`
+    const data = JSON.stringify({ url })
+    let dispatched = 0
+    for (const reply of extEventStreams) {
+      try {
+        reply.raw.write(`event: openUsagePage\ndata: ${data}\n\n`)
+        dispatched++
+      }
+      catch {
+        extEventStreams.delete(reply)
+      }
+    }
+    return { ok: true, dispatched }
+  })
 
   server.get('/auth/full_stripe_profile', async () => ({
     membershipType: 'ultra',

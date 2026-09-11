@@ -101,9 +101,6 @@ export const BYOK_REDIRECT: readonly string[] = [
   'REST:/auth/logout',
 ]
 
-/** 兼容旧调用: 完整白名单 = BASE + BYOK */
-export const DEFAULT_REDIRECT: readonly string[] = [...BASE_REDIRECT, ...BYOK_REDIRECT]
-
 /** BYOK 开关: 1 = on (BYOK 启用), 0 = off (走官方) */
 export type ByokMode = 0 | 1
 

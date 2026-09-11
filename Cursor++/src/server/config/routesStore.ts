@@ -89,19 +89,6 @@ export function setServerPort(port: number): Promise<RoutesConfig> {
   })
 }
 
-export function addRedirect(entry: string): Promise<RoutesConfig> {
-  return updateRoutes((draft) => {
-    if (!draft.redirect.includes(entry))
-      draft.redirect.push(entry)
-  })
-}
-
-export function removeRedirect(entry: string): Promise<RoutesConfig> {
-  return updateRoutes((draft) => {
-    draft.redirect = draft.redirect.filter(x => x !== entry)
-  })
-}
-
 // ── BYOK 开关 ──
 
 export function getByokMode(): ByokMode {

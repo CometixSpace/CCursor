@@ -13,6 +13,7 @@ import { encodeOpenAIRequestMessages, encodeOpenAITools } from './conversationCo
 import { createProxiedFetch } from './proxyFetch';
 import { createTransformDiagnostics, hasTransformMutations, transformMessages } from './transformMessages';
 import { buildDefaultHeaders } from './userAgent';
+import { withProviderRequestLifecycle } from './requestLifecycle';
 
 export class OpenAIChatProvider implements LLMProvider {
     readonly name = 'openai-chat';
@@ -33,7 +34,11 @@ export class OpenAIChatProvider implements LLMProvider {
         this.client = new OpenAI(opts);
     }
 
-    async *stream(request: LLMStreamRequest): AsyncIterable<LLMStreamEvent> {
+    stream(request: LLMStreamRequest): AsyncIterable<LLMStreamEvent> {
+        return withProviderRequestLifecycle(lifecycle => this.streamRequest({ ...request, signal: lifecycle.signal }), request.signal);
+    }
+
+    private async *streamRequest(request: LLMStreamRequest): AsyncIterable<LLMStreamEvent> {
         const diagnostics = createTransformDiagnostics('openai-chat', request.messages.length);
         const transformed = transformMessages(request.messages, 'openai-chat', diagnostics, request.model);
         if (hasTransformMutations(diagnostics)) {
@@ -62,7 +67,7 @@ export class OpenAIChatProvider implements LLMProvider {
             params.reasoning_effort = request.thinkingLevel;
         }
 
-        const stream = await this.client.chat.completions.create(params);
+        const stream = await this.client.chat.completions.create(params, { signal: request.signal });
 
         const toolCalls = new Map<number, { id: string; name: string; args: string }>();
         let usage: { inputTokens: number; outputTokens: number; cacheReadTokens?: number } | null = null;

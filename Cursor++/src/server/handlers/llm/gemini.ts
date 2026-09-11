@@ -11,6 +11,25 @@ import type { LLMProvider, LLMStreamRequest, LLMStreamEvent } from './types';
 import { encodeGeminiRequestMessages, encodeGeminiTools } from './conversationCodec';
 import { createTransformDiagnostics, hasTransformMutations, transformMessages } from './transformMessages';
 import { buildDefaultHeaders } from './userAgent';
+import { withProviderRequestLifecycle } from './requestLifecycle';
+
+function guardGeminiAbortSubscription(signal: AbortSignal | undefined): AbortSignal | undefined {
+    if (!signal) return undefined;
+    // @google/genai 2.7.0 subscribes after async setup without checking aborted.
+    // Reject a late subscription instead of dispatching HTTP for a stopped run.
+    return new Proxy(signal, {
+        get(target, property) {
+            if (property === 'addEventListener') {
+                return (...parameters: Parameters<AbortSignal['addEventListener']>) => {
+                    if (parameters[0] === 'abort') target.throwIfAborted();
+                    target.addEventListener(...parameters);
+                };
+            }
+            const value: unknown = Reflect.get(target, property, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+        },
+    });
+}
 
 function mapThinkingLevelToGemini(level: NonNullable<LLMStreamRequest['thinkingLevel']>): ThinkingLevel {
     switch (level) {
@@ -41,7 +60,11 @@ export class GeminiProvider implements LLMProvider {
         this.client = new GoogleGenAI(opts);
     }
 
-    async *stream(request: LLMStreamRequest): AsyncIterable<LLMStreamEvent> {
+    stream(request: LLMStreamRequest): AsyncIterable<LLMStreamEvent> {
+        return withProviderRequestLifecycle(lifecycle => this.streamRequest({ ...request, signal: lifecycle.signal }), request.signal);
+    }
+
+    private async *streamRequest(request: LLMStreamRequest): AsyncIterable<LLMStreamEvent> {
         const diagnostics = createTransformDiagnostics('gemini', request.messages.length);
         const transformed = transformMessages(request.messages, 'gemini', diagnostics, request.model);
         if (hasTransformMutations(diagnostics)) {
@@ -55,6 +78,7 @@ export class GeminiProvider implements LLMProvider {
 
         const genConfig: GenerateContentConfig = {
             maxOutputTokens: request.maxTokens ?? 8192,
+            abortSignal: guardGeminiAbortSubscription(request.signal),
         };
 
         if (encoded.systemInstruction) {

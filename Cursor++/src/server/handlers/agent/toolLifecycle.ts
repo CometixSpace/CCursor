@@ -4,6 +4,7 @@ import type { ReadContextState } from './contextCatalog';
 import { collectReadContextAttachments, cursorRuleToProtoInit } from './contextCatalog';
 import type { LLMContentBlock, LLMMessage } from '../llm/types';
 import { toolCallCompleted } from './stream';
+import type { TaskEntryTruncationContext } from './toolkit/results/taskToolResults';
 import {
     buildToolResultText,
     isToolResultError,
@@ -45,6 +46,8 @@ export function finalizeToolCall(params: {
     input: Record<string, unknown>;
     modelCallId: string;
     readContext?: ReadContextState;
+    /** Task 报告入口截断上下文 (conversationId + 窗口) — 仅 Task 路径需要 */
+    entryTruncation?: TaskEntryTruncationContext;
 }): { toolResult: ToolResultEnvelope; resultText: string; frame: AgentServerMessage; imageBlock: Extract<LLMContentBlock, { type: 'image' }> | null } {
     const toolResult = normalizeToolResult(params.cursorToolType, params.rawToolResult, params.input);
     let relatedSkills: ReturnType<typeof collectReadContextAttachments>['skills'] = [];
@@ -72,7 +75,7 @@ export function finalizeToolCall(params: {
         }
     }
 
-    let resultText = buildToolResultText(params.cursorToolType, toolResult, params.input);
+    let resultText = buildToolResultText(params.cursorToolType, toolResult, params.input, params.entryTruncation);
     if (params.cursorToolType === 'readToolCall' && toolResult.result?.case === 'success') {
         const success = toolResult.result.value as Record<string, unknown>;
         const relatedRules = Array.isArray(success.relatedCursorRules)

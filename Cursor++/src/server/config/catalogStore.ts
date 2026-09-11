@@ -158,16 +158,3 @@ export function searchCatalog(query: string, limit = 20): CatalogEntry[] {
     .map(r => r.item)
     .sort((a, b) => (b.releaseDate ?? '').localeCompare(a.releaseDate ?? ''))
 }
-
-/** 测试用 */
-export function resetCatalogCacheForTests(): void {
-  cache = null
-  fuse = null
-  loadAttempted = false
-}
-
-export function setCatalogForTests(entries: CatalogEntry[]): void {
-  cache = entries
-  fuse = buildFuse(entries)
-  loadAttempted = true
-}

@@ -47,7 +47,6 @@ export function loadSupermarkdown(): LoadResult {
   try {
     // Lazy-load the native module so extension activation does not fail when
     // Windows lacks the MSVC runtime required by supermarkdown.win32-x64-msvc.node.
-    // eslint-disable-next-line ts/no-require-imports
     const mod = require('@vakra-dev/supermarkdown') as { convert?: ConvertFn }
     if (typeof mod.convert !== 'function')
       throw new TypeError('@vakra-dev/supermarkdown did not export convert()')

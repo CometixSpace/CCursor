@@ -53,7 +53,6 @@ export function emptyParsed(): ParsedRunRequest {
     readPaths: [],
     historyBlobIds: [],
     historyTurnBlobIds: [],
-    historyTurns: [],
     historySummaryArchiveIds: [],
     historyTokenDetails: undefined,
     rawUserMessage: undefined,

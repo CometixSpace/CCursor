@@ -22,6 +22,7 @@ import { join } from 'node:path';
 import type { McpStateServerInfo, McpStateToolDefinition } from './mcpState';
 import type { LLMTool } from '../llm/types';
 import { findToolByAlias } from './toolRegistry';
+import { assertSafeForServerFs } from './toolkit/pathUtils';
 
 /** 截断后缀 — 实测原文,长度 15 */
 const TRUNCATION_SUFFIX = '... [truncated]';
@@ -228,7 +229,7 @@ export function validateDynamicToolsQuery(query: DynamicToolsQuery): string | un
     if (query.pattern.length > 256)
         return 'pattern cannot exceed 256 characters.';
     try {
-        new RegExp(query.pattern);
+        RegExp(query.pattern);
         return undefined;
     }
     catch (error) {
@@ -444,6 +445,8 @@ export async function serializeDynamicToolsResult(
         return { content: payload, payloadBytes, wroteToFile: false };
     }
 
+    // Validate before join() can normalize away a leading UNC separator.
+    assertSafeForServerFs(projectDir, 'Dynamic tool result spill');
     const outputDir = join(projectDir, 'agent-tools');
     await mkdir(outputDir, { recursive: true, mode: 0o700 });
     const outputFilePath = join(outputDir, `${randomUUID()}.txt`);

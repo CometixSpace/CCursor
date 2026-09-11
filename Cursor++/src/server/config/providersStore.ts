@@ -146,17 +146,6 @@ export function flattenModels(): ResolvedProviderModel[] {
   return out
 }
 
-export function getProvider(providerId: string): ProviderEntry | null {
-  const config = cache ?? loadProviders()
-  return config.providers.find(p => p.id === providerId) ?? null
-}
-
-/** 测试用: 重置缓存 */
-export function resetProvidersCacheForTests(): void {
-  cache = null
-  reverseIndex = new Map()
-}
-
 /** 测试用: 直接注入 in-memory providers, 跳过磁盘读写 */
 export function setProvidersForTests(config: ProvidersConfig): void {
   cache = clone(config)

@@ -13,6 +13,7 @@ obfuscate.js
 vsc-extension-quickstart.md
 CHANGELOG.md
 pnpm-lock.yaml
+bun.lock
 pnpm-workspace.yaml
 **/tsconfig.json
 **/eslint.config.mjs

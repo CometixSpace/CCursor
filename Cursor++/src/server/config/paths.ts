@@ -54,6 +54,22 @@ export function getLogsDir(): string {
 }
 
 /**
+ * 工具输出溢出落盘目录 ~/.ccursor/spill。
+ *
+ * 入口截断 (Task 报告 ENTRY_CAP) 在截断前把全文写入
+ *   ~/.ccursor/spill/<conversationId>/<toolCallId>.txt
+ * 截断标注携带该路径 —— 满足"被截断内容可恢复"约束 (设计文档 §3.2 审计修正)。
+ */
+export function getSpillDir(): string {
+  return join(getCcursorDir(), 'spill')
+}
+
+/** 单会话 spill 子目录: ~/.ccursor/spill/<conversationId> */
+export function getConversationSpillDir(conversationId: string): string {
+  return join(getSpillDir(), conversationId)
+}
+
+/**
  * 每窗口一个独立日志文件, 避免多实例并发写冲突。
  *   windowId 来自 VSCODE_PROCESS_TITLE 中的 [N-M],
  *   workspace 来自 vscode.workspace.name (无 workspace 时用 'no-workspace').

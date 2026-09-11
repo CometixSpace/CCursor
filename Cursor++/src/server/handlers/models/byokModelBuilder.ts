@@ -8,12 +8,11 @@
  *   - 有 parameters 配置时生成 parameterDefinitions + 笛卡尔积 variants (Edit 面板)
  *   - 无 parameters 时单 variant (向后兼容,无 Edit 按钮)
  */
-import type { ProviderEntry, ProviderModel, ProviderType, ThinkingLevel } from '../../data/defaults'
+import type { ProviderEntry, ProviderModel } from '../../data/defaults'
 import type { RequestedModel_ModelParameterValue } from '../../gen/agent_v1_pb'
 import type {
   AvailableModelsResponse_AvailableModel,
   ModelParameterDefinition,
-  ModelParameterDefinition_ModelParameterType,
 } from '../../gen/aiserver_v1_pb'
 import { create } from '@bufbuild/protobuf'
 import { flattenModels } from '../../config/providersStore'
@@ -211,7 +210,7 @@ function cartesianProduct(axes: ParamAxis[]): VariantCombo[] {
   return result
 }
 
-function buildVariantSuffix(combo: VariantCombo, providerType: ProviderType, contextTokenLimit?: number): string | null {
+function buildVariantSuffix(combo: VariantCombo, contextTokenLimit?: number): string | null {
   const segments: string[] = []
 
   const reasoning = combo.params.get('reasoning')
@@ -256,7 +255,7 @@ function buildVariantSuffix(combo: VariantCombo, providerType: ProviderType, con
   return segments.length > 0 ? segments.join(' ') : null
 }
 
-function isDefaultCombo(combo: VariantCombo, model: ProviderModel, providerType: ProviderType): boolean {
+function isDefaultCombo(combo: VariantCombo, model: ProviderModel): boolean {
   for (const [id, val] of combo.params) {
     switch (id) {
       case 'reasoning':
@@ -392,9 +391,9 @@ function buildAvailableModelFromByok(
   if (defs.length > 0 && axes.length > 0) {
     const combos = cartesianProduct(axes)
     variants = combos.map((combo) => {
-      const suffix = buildVariantSuffix(combo, provider.type, model.contextTokenLimit)
+      const suffix = buildVariantSuffix(combo, model.contextTokenLimit)
       const displayName = wrapDisplayName(model.displayName, suffix)
-      const isDefault = isDefaultCombo(combo, model, provider.type)
+      const isDefault = isDefaultCombo(combo, model)
       return create(AvailableModelsResponse_ModelVariantConfigSchema, {
         displayName,
         displayNameOutsidePicker: displayName,

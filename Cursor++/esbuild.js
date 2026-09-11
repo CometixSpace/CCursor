@@ -115,12 +115,30 @@ async function main() {
     plugins: [esbuildProblemMatcherPlugin],
   });
 
+  // ── Context 3: Usage Dashboard (Browser, IIFE) ──
+  // 独立入口 — 只被 Dashboard panel 加载, 不影响侧栏 webview.js 体积
+  const dashCtx = await esbuild.context({
+    entryPoints: ["src/ui/dashboard/entry.ts"],
+    bundle: true,
+    format: "iife",
+    minify: production,
+    sourcemap: false,
+    platform: "browser",
+    outfile: "dist/dashboard.js",
+    logLevel: "silent",
+    plugins: [esbuildProblemMatcherPlugin],
+  });
+
   if (watch) {
     copyRuntimeAssets();
-    await Promise.all([extCtx.watch(), webCtx.watch()]);
+    await Promise.all([extCtx.watch(), webCtx.watch(), dashCtx.watch()]);
   } else {
-    await Promise.all([extCtx.rebuild(), webCtx.rebuild()]);
-    await Promise.all([extCtx.dispose(), webCtx.dispose()]);
+    await Promise.all([
+      extCtx.rebuild(),
+      webCtx.rebuild(),
+      dashCtx.rebuild(),
+    ]);
+    await Promise.all([extCtx.dispose(), webCtx.dispose(), dashCtx.dispose()]);
     copyRuntimeAssets();
   }
 }

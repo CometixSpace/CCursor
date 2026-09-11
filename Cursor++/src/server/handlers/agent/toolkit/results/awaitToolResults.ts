@@ -106,9 +106,8 @@ export function buildAwaitToolResultText(
         }
         case 'stillRunning': {
             const transcriptPath = str(value.transcriptPath).trim();
-            return `Subagent ${str(value.agentId)} is still running.`
-                + (transcriptPath ? ` [transcript: ${transcriptPath}]` : '')
-                + ' Poll again with AwaitShell to keep monitoring.';
+            const transcriptHint = transcriptPath ? ` [transcript: ${transcriptPath}]` : '';
+            return `Subagent ${str(value.agentId)} is still running.${transcriptHint} Poll again with AwaitShell to keep monitoring.`;
         }
         case 'notFound':
             return `No background job found for id ${str(value.agentId)}.`;

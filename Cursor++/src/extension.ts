@@ -1,5 +1,7 @@
+import type { StartServerOptions } from './server'
 import { createWriteStream, existsSync, mkdirSync } from 'node:fs'
 import * as http from 'node:http'
+import { join } from 'node:path'
 import * as vscode from 'vscode'
 import { bumpRefreshSignal, pushRoutesUpdate, startServer, stopServer } from './server'
 import { getServerConfig } from './server/config'
@@ -10,12 +12,20 @@ import { isLikelyWindowsMsvcMissing, preflightSupermarkdown, setSupermarkdownNat
 import { resetProviderInstanceCache } from './server/handlers/llm/providerRuntime'
 import { initLogger } from './server/logger'
 import { getRoutesFilePath } from './server/routes'
+import { renderDashboardPageHtml } from './ui/dashboard/pageChrome'
 import { PanelProvider } from './ui/panel-provider'
 import { getState, onStateChange, probeByokServer, refreshState, setFileLogState } from './ui/state'
+import { openUsageDashboard } from './ui/usage-dashboard'
 import { startUpdateCheck, stopUpdateCheck } from './update-check'
 
 let outputChannel: vscode.LogOutputChannel
 let statusBarItem: vscode.StatusBarItem
+
+// 扩展安装根 — activate() 时记录一次, 供 doStartServer 构造浏览器版 Dashboard
+// 的资源路径 (dist/dashboard.js)。doStartServer 的调用方 (toggleServer /
+// attemptTakeover) 拿不到 context, 模块级 set-once 是最小传参调整;
+// activationEvents: "*" 保证任何 server 启动前 activate 已先执行。
+let extensionAssetsBasePath: string | null = null
 
 // 窗口标识 — 从 VSCODE_PROCESS_TITLE 的 [N-M] 提取, 提前声明供 initLogFilePath 读取
 let myWindowId: number | null = null
@@ -238,6 +248,97 @@ function disconnectLogStream() {
   }
 }
 
+// ── Ext Events SSE 订阅 (renderer → ext host 桥) ──
+//
+// Agents Window (glass) 注入按钮跑在 renderer, 无扩展进程直连; server 的
+// /byok/ext-events 把 openUsagePage 这类需要 vscode.commands 的动作广播
+// 给各窗口 ext host, 由聚焦窗口执行 (玻璃命令 glass.openBrowserTab 在
+// Agents Window 的内置浏览器打开 Usage Dashboard)。
+// 断线由 5s 定时重试兜底 (server takeover 期间会断); server offline 属
+// 正常态, 连接失败静默。
+
+let extEventsRequest: http.ClientRequest | null = null
+let extEventsRetryTimer: ReturnType<typeof setTimeout> | null = null
+let extEventsStopped = false
+
+function disconnectExtEventsStream() {
+  if (extEventsRequest) {
+    extEventsRequest.destroy()
+    extEventsRequest = null
+  }
+}
+
+function scheduleExtEventsReconnect() {
+  if (extEventsStopped || extEventsRetryTimer)
+    return
+  extEventsRetryTimer = setTimeout(() => {
+    extEventsRetryTimer = null
+    connectExtEventsStream()
+  }, 5000)
+}
+
+/** 广播打到所有窗口, 只有用户刚点击的 (必然聚焦的) 那个窗口执行 */
+async function handleOpenUsagePage(url: string): Promise<void> {
+  if (!vscode.window.state.focused)
+    return
+  try {
+    await vscode.commands.executeCommand('glass.openBrowserTab', {
+      url,
+      preserveFocus: false,
+      inactive: false,
+      focusOmnibar: false,
+      reuseExistingUrlTab: true,
+    })
+  }
+  catch {
+    // 编辑器窗口聚焦时理论到不了这里; catch 兜底保证任何窗口都有可用行为
+    void vscode.env.openExternal(vscode.Uri.parse(url))
+  }
+}
+
+function connectExtEventsStream() {
+  disconnectExtEventsStream()
+  const { host, port } = getServerConfig()
+  const request = http.get(`http://${host}:${port}/byok/ext-events`, (res) => {
+    let buf = ''
+    res.on('data', (chunk: Buffer) => {
+      buf += chunk.toString()
+      const parts = buf.split('\n\n')
+      buf = parts.pop() || ''
+      for (const part of parts) {
+        const lines = part.split('\n')
+        let eventType = ''
+        let dataLine = ''
+        for (const l of lines) {
+          if (l.startsWith('event: '))
+            eventType = l.slice(7).trim()
+          else if (l.startsWith('data: '))
+            dataLine = l.slice(6)
+        }
+        if (eventType === 'openUsagePage' && dataLine) {
+          try {
+            const payload = JSON.parse(dataLine) as { url?: string }
+            if (payload.url)
+              void handleOpenUsagePage(payload.url)
+          }
+          catch { /* 非 JSON data 忽略 */ }
+        }
+      }
+    })
+    res.on('end', () => {
+      extEventsRequest = null
+      scheduleExtEventsReconnect()
+    })
+  })
+
+  request.on('error', () => {
+    extEventsRequest = null
+    scheduleExtEventsReconnect()
+  })
+
+  extEventsRequest = request
+}
+
 async function onSseDisconnect() {
   if (getState().server === 'local')
     return // owner 自己关闭,不需要接管
@@ -327,6 +428,48 @@ function stopHeartbeat() {
   }
 }
 
+// ── 今日用量摘要 (状态栏 tooltip 数据) ──
+//
+// 周期 (60s) 从 server 拉取 range=today 的原始行自行求和,
+// 失败静默置 null (tooltip 隐藏该行), 绝不影响状态栏其他内容。
+
+let todayUsageSummary: { totalTokens: number, requests: number } | null = null
+
+/** K/M 缩写 — 与 Dashboard 前端 formatTokenCount 同规则 */
+function formatTokenCountForTooltip(value: number): string {
+  if (value >= 1_000_000)
+    return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`
+  if (value >= 1_000)
+    return `${(value / 1_000).toFixed(1).replace(/\.0$/, '')}K`
+  return String(value)
+}
+
+async function refreshStatusBarUsageSummary(): Promise<void> {
+  if (getState().server === 'offline') {
+    todayUsageSummary = null
+    renderStatusBar()
+    return
+  }
+  try {
+    const { host, port } = getServerConfig()
+    const response = await fetch(`http://${host}:${port}/byok/usage-stats?range=today`, {
+      signal: AbortSignal.timeout(5000),
+    })
+    if (!response.ok)
+      throw new Error(`HTTP ${response.status}`)
+    const payload = await response.json() as { rows?: Array<{ inputTokens: number, outputTokens: number, requestCount: number }> }
+    const rows = Array.isArray(payload.rows) ? payload.rows : []
+    todayUsageSummary = rows.reduce((summary, row) => ({
+      totalTokens: summary.totalTokens + row.inputTokens + row.outputTokens,
+      requests: summary.requests + row.requestCount,
+    }), { totalTokens: 0, requests: 0 })
+  }
+  catch {
+    todayUsageSummary = null
+  }
+  renderStatusBar()
+}
+
 // ── 状态栏渲染 ──
 //
 // 复合状态: 同时显示 server 进程状态 + BYOK Mode 开关
@@ -335,6 +478,8 @@ function stopHeartbeat() {
 //   - 整体颜色: BYOK off 时给警告色提示
 //
 // 点击 → toggle BYOK Mode (非 server)。Server 启停走命令面板/侧边栏。
+// tooltip 是 MarkdownString: 含可点击的 Open Usage Dashboard 命令链接,
+// 需要 isTrusted = true 才能激活 command: 链接; supportThemeIcons 启用 $(graph)。
 
 function renderStatusBar() {
   const s = getState()
@@ -356,8 +501,19 @@ function renderStatusBar() {
     ? 'BYOK ON — using local providers.json'
     : 'BYOK OFF — passing through to official Cursor'
 
+  // tooltip: server/byok 语义保持不变, 追加今日摘要 (有数据才显示) + Dashboard 链接。
+  // 链接始终可见 (入口可发现性), 仅摘要行依赖数据 — 摘要拉取失败/未就绪时只隐藏摘要。
+  const tooltip = new vscode.MarkdownString(undefined, true)
+  tooltip.isTrusted = true
+  tooltip.appendMarkdown(`${serverTip}\n\n${byokTip}`)
+  tooltip.appendMarkdown(`\n\n---`)
+  if (todayUsageSummary)
+    tooltip.appendMarkdown(`\n\n今日: **${formatTokenCountForTooltip(todayUsageSummary.totalTokens)}** tokens · **${todayUsageSummary.requests}** requests`)
+  tooltip.appendMarkdown(`\n\n$(graph) [Open Usage Dashboard](command:cursor2plus.openUsageDashboard)`)
+  tooltip.appendMarkdown(`\n\n---\n\nClick: toggle BYOK Mode`)
+
   statusBarItem.text = `${serverIcon} BYOK ${byokGlyph}`
-  statusBarItem.tooltip = `${serverTip}\n${byokTip}\n\nClick: toggle BYOK Mode`
+  statusBarItem.tooltip = tooltip
   statusBarItem.backgroundColor = s.byokMode
     ? undefined
     : new vscode.ThemeColor('statusBarItem.warningBackground')
@@ -416,10 +572,18 @@ async function doStartServer() {
   }
 
   try {
-    const { host, port } = await startServer({
+    const startOptions: StartServerOptions = {
       host: cfg.host,
       port: cfg.port,
-    })
+    }
+    // 浏览器版 Dashboard (/byok/usage): Agents Window 入口用, 缺资源时降级 503
+    if (extensionAssetsBasePath) {
+      startOptions.usageDashboardPage = {
+        html: renderDashboardPageHtml({ scriptSrc: '/byok/usage.js', includeBrowserThemeDefaults: true }),
+        dashboardJsPath: join(extensionAssetsBasePath, 'dist', 'dashboard.js'),
+      }
+    }
+    const { host, port } = await startServer(startOptions)
     log('info', `[SRV] listening at http://${host}:${port}`)
     stopHeartbeat()
   }
@@ -455,6 +619,8 @@ async function doStartServer() {
 export async function activate(context: vscode.ExtensionContext) {
   outputChannel = vscode.window.createOutputChannel('Cursor++', { log: true })
   initLogger((level, msg) => writeToChannel({ level, msg }))
+  // 扩展根路径先于任何 startServer 调用记录 (浏览器版 Dashboard 资源定位用)
+  extensionAssetsBasePath = context.extensionPath
   setupSupermarkdownNativeTip()
   preflightSupermarkdown()
   log('info', 'Cursor++ activating...')
@@ -503,6 +669,7 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
     vscode.commands.registerCommand('cursor2plus.toggleFileLog', () => toggleFileLog(context)),
     vscode.commands.registerCommand('cursor2plus.openLogFile', () => openLogFile()),
+    vscode.commands.registerCommand('cursor2plus.openUsageDashboard', () => openUsageDashboard(context)),
   )
 
   // 确保配置文件存在 —— 即使 server 未启动,面板也能读写
@@ -535,6 +702,12 @@ export async function activate(context: vscode.ExtensionContext) {
     await refreshState()
   }
 
+  // 今日用量摘要: server 尝试自启动之后初始拉一次 (启动前必然 offline, 拉了也是空),
+  // 再挂 60s 周期刷新 (tooltip 数据)
+  void refreshStatusBarUsageSummary()
+  const usageSummaryTimer = setInterval(() => void refreshStatusBarUsageSummary(), 60_000)
+  context.subscriptions.push({ dispose: () => clearInterval(usageSummaryTimer) })
+
   if (getState().server === 'remote')
     startHeartbeat()
 
@@ -552,6 +725,9 @@ export async function activate(context: vscode.ExtensionContext) {
     log('warn', '[SRV] could not parse windowId from VSCODE_PROCESS_TITLE')
   }
 
+  // renderer→ext host 桥订阅 — 每个窗口的 ext host 都挂上, 由聚焦窗口消费
+  connectExtEventsStream()
+
   if (fileLogEnabled)
     log('info', `[SRV] file logging restored from globalState → ${logFilePath}`)
 
@@ -564,6 +740,12 @@ export async function activate(context: vscode.ExtensionContext) {
 export async function deactivate() {
   stopUpdateCheck()
   stopHeartbeat()
+  extEventsStopped = true
+  if (extEventsRetryTimer) {
+    clearTimeout(extEventsRetryTimer)
+    extEventsRetryTimer = null
+  }
+  disconnectExtEventsStream()
   disconnectLogStream()
   closeLogFileStream()
   stopRoutesWatcher()

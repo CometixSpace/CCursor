@@ -6,7 +6,7 @@
  *
  * API 说明:
  * - @vscode/sqlite3 基于 node-sqlite3，是异步回调 API
- * - 本 wrapper 提供 Promise 化的接口（AsyncDatabase / AsyncStatement）
+ * - 本 wrapper 提供 Promise 化的 AsyncDatabase 接口
  * - getAgentDatabase() 保持同步返回已打开的实例
  * - initDatabase() 为异步，必须在 startServer() 时先调用
  */
@@ -124,15 +124,7 @@ export interface RunResult {
   changes: number
 }
 
-export interface AsyncStatement {
-  run: (params?: unknown) => Promise<RunResult>
-  get: <T = unknown>(params?: unknown) => Promise<T | undefined>
-  all: <T = unknown>(params?: unknown) => Promise<T[]>
-  finalize: () => Promise<void>
-}
-
 export interface AsyncDatabase {
-  prepare: (sql: string) => AsyncStatement
   exec: (sql: string) => Promise<void>
   run: (sql: string, params?: unknown) => Promise<RunResult>
   get: <T = unknown>(sql: string, params?: unknown) => Promise<T | undefined>
@@ -143,60 +135,8 @@ export interface AsyncDatabase {
 
 // ---------- wrapper implementation ----------
 
-function wrapStatement(stmt: any): AsyncStatement {
-  return {
-    run(params?: unknown): Promise<RunResult> {
-      return new Promise((resolve, reject) => {
-        const cb = function (this: any, err: Error | null) {
-          if (err)
-            reject(err)
-          else resolve({ lastID: this.lastID as number, changes: this.changes as number })
-        }
-        if (params === undefined)
-          stmt.run(cb)
-        else
-          stmt.run(params, cb)
-      })
-    },
-    get<T = unknown>(params?: unknown): Promise<T | undefined> {
-      return new Promise((resolve, reject) => {
-        const cb = (err: Error | null, row: T | undefined) => {
-          if (err)
-            reject(err)
-          else resolve(row)
-        }
-        if (params === undefined)
-          stmt.get(cb)
-        else
-          stmt.get(params, cb)
-      })
-    },
-    all<T = unknown>(params?: unknown): Promise<T[]> {
-      return new Promise((resolve, reject) => {
-        const cb = (err: Error | null, rows: T[] | undefined) => {
-          if (err)
-            reject(err)
-          else resolve(rows || [])
-        }
-        if (params === undefined)
-          stmt.all(cb)
-        else
-          stmt.all(params, cb)
-      })
-    },
-    finalize(): Promise<void> {
-      return new Promise((resolve, reject) => {
-        stmt.finalize((err: Error | null) => err ? reject(err) : resolve())
-      })
-    },
-  }
-}
-
 function wrapDatabase(rawDb: any): AsyncDatabase {
   const db: AsyncDatabase = {
-    prepare(sql: string): AsyncStatement {
-      return wrapStatement(rawDb.prepare(sql))
-    },
     exec(sql: string): Promise<void> {
       return new Promise((resolve, reject) => {
         rawDb.exec(sql, (err: Error | null) => err ? reject(err) : resolve())
@@ -269,27 +209,38 @@ function wrapDatabase(rawDb: any): AsyncDatabase {
 // ---------- module state ----------
 
 let db: AsyncDatabase | null = null
+let checkpointDatabase: AsyncDatabase | null = null
 let dbPath: string | null = null
 
 export function resolveAgentDatabasePath(): string {
   return process.env.BYOK_AGENT_DB_PATH || getDatabaseFilePath()
 }
 
+async function openDatabaseConnection(databasePath: string): Promise<AsyncDatabase> {
+  const sqlite3 = loadSqlite3()
+  const rawDatabase = await new Promise<unknown>((resolve, reject) => {
+    const instance = new sqlite3.Database(databasePath, (error: Error | null) => {
+      if (error)
+        reject(error)
+      else resolve(instance)
+    })
+  })
+  const database = wrapDatabase(rawDatabase)
+  try {
+    await database.exec('PRAGMA busy_timeout = 5000')
+    await database.exec('PRAGMA journal_mode = WAL')
+    await database.exec('PRAGMA synchronous = NORMAL')
+    await database.exec('PRAGMA foreign_keys = ON')
+    return database
+  }
+  catch (error) {
+    await database.close()
+    throw error
+  }
+}
+
 async function initializeSchema(database: AsyncDatabase): Promise<void> {
-  // WAL 模式 + 性能 pragmas
-  await database.exec('PRAGMA journal_mode = WAL')
-  await database.exec('PRAGMA synchronous = NORMAL')
-  await database.exec('PRAGMA foreign_keys = ON')
-  await database.exec('PRAGMA busy_timeout = 5000')
-
   await database.exec(`
-    CREATE TABLE IF NOT EXISTS agent_blobs (
-      blob_id TEXT PRIMARY KEY,
-      blob_data TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      last_accessed_at INTEGER NOT NULL
-    );
-
     CREATE TABLE IF NOT EXISTS conversation_checkpoints (
       conversation_id TEXT NOT NULL,
       kind TEXT NOT NULL DEFAULT 'committed',
@@ -300,11 +251,10 @@ async function initializeSchema(database: AsyncDatabase): Promise<void> {
       max_tokens INTEGER NOT NULL,
       mode TEXT NOT NULL,
       updated_at INTEGER NOT NULL,
+      write_token TEXT NOT NULL DEFAULT '',
+      is_deleted INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (conversation_id, kind)
     );
-
-    CREATE INDEX IF NOT EXISTS idx_agent_blobs_last_accessed_at
-      ON agent_blobs(last_accessed_at);
 
     CREATE INDEX IF NOT EXISTS idx_conversation_checkpoints_updated_at
       ON conversation_checkpoints(updated_at);
@@ -324,6 +274,25 @@ async function initializeSchema(database: AsyncDatabase): Promise<void> {
 
     CREATE INDEX IF NOT EXISTS idx_conversation_summaries_lookup
       ON conversation_summaries(conversation_id, kind, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS model_usage_stats (
+      day TEXT NOT NULL,
+      hour INTEGER NOT NULL,
+      provider_id TEXT NOT NULL,
+      provider_name TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      api_model TEXT NOT NULL,
+      request_count INTEGER NOT NULL DEFAULT 0,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+      last_used_at INTEGER NOT NULL,
+      PRIMARY KEY (day, hour, provider_id, model_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_model_usage_stats_day
+      ON model_usage_stats(day);
   `)
 
   // ── Schema 迁移: conversation_checkpoints 新增 kind 列 ──
@@ -366,6 +335,42 @@ async function initializeSchema(database: AsyncDatabase): Promise<void> {
       ADD COLUMN turn_blob_ids_json TEXT NOT NULL DEFAULT '[]';
     `)
   }
+
+  // Add the ownership token after older table rebuilds so their row shape stays valid.
+  const checkpointColumns = await database.all<{ name: string }>('PRAGMA table_info(conversation_checkpoints)')
+  if (!checkpointColumns.some(column => column.name === 'write_token')) {
+    await database.exec(`
+      ALTER TABLE conversation_checkpoints
+      ADD COLUMN write_token TEXT NOT NULL DEFAULT '';
+    `)
+  }
+  // Deleted checkpoints retain their tokens so old run scopes cannot resurrect them.
+  if (!checkpointColumns.some(column => column.name === 'is_deleted')) {
+    await database.exec(`
+      ALTER TABLE conversation_checkpoints
+      ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0;
+    `)
+  }
+  if (!checkpointColumns.some(column => column.name === 'terminal_receipt_json')) {
+    await database.exec(`
+      ALTER TABLE conversation_checkpoints
+      ADD COLUMN terminal_receipt_json TEXT NOT NULL DEFAULT '';
+    `)
+  }
+
+  // Recovery snapshots are metadata, not a second blob store. Never prune them
+  // during upgrades: they retain both candidates before a conditional adoption.
+  await database.exec(`
+    CREATE TABLE IF NOT EXISTS conversation_checkpoint_recovery (
+      snapshot_id TEXT PRIMARY KEY NOT NULL,
+      conversation_id TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      checkpoint_rows_json TEXT NOT NULL,
+      preserved_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_checkpoint_recovery_conversation
+      ON conversation_checkpoint_recovery(conversation_id);
+  `)
 }
 
 /**
@@ -377,25 +382,30 @@ export async function initDatabase(): Promise<void> {
   if (db && dbPath === nextPath)
     return
 
-  if (db) {
-    await db.close()
-    db = null
-  }
+  await closeAgentDatabase()
 
   mkdirSync(dirname(nextPath), { recursive: true })
 
-  const sqlite3 = loadSqlite3()
-  const rawDb = await new Promise<unknown>((resolve, reject) => {
-    const instance = new (sqlite3 as any).Database(nextPath, (err: Error | null) => {
-      if (err)
-        reject(err)
-      else resolve(instance)
-    })
-  })
+  const nextDatabase = await openDatabaseConnection(nextPath)
+  try {
+    // Legacy blob tables are left untouched; runtime blob storage is not SQLite.
+    await initializeSchema(nextDatabase)
+    // Checkpoint acceptance must not join a summary/usage transaction on the shared
+    // connection. This connection is autocommit-only; each CAS is one statement.
+    checkpointDatabase = await openDatabaseConnection(nextPath)
+  }
+  catch (error) {
+    try {
+      await nextDatabase.close()
+    }
+    catch (closeError) {
+      logger.warn({ error: (closeError as Error).message }, '[DB] failed to close database after schema initialization failed')
+    }
+    throw error
+  }
 
-  db = wrapDatabase(rawDb)
+  db = nextDatabase
   dbPath = nextPath
-  await initializeSchema(db)
   logger.info({ agentDbPath: nextPath }, '[DB] agent sqlite persistence ready')
 }
 
@@ -410,7 +420,19 @@ export function getAgentDatabase(): AsyncDatabase {
   return db
 }
 
+/** Only single-statement operations; never expose transaction/exec to checkpoint callers. */
+export function getCheckpointDatabase(): Pick<AsyncDatabase, 'get' | 'all' | 'run'> {
+  if (!checkpointDatabase) {
+    throw new Error('Database not initialized. Call initDatabase() first.')
+  }
+  return checkpointDatabase
+}
+
 export async function closeAgentDatabase(): Promise<void> {
+  if (checkpointDatabase) {
+    await checkpointDatabase.close()
+    checkpointDatabase = null
+  }
   if (!db)
     return
   await db.close()

@@ -28,6 +28,7 @@ import { logger } from '../../logger';
 import { createProxiedFetch } from './proxyFetch';
 import { createTransformDiagnostics, hasTransformMutations, transformMessages } from './transformMessages';
 import { buildDefaultHeaders } from './userAgent';
+import { withProviderRequestLifecycle } from './requestLifecycle';
 
 type AnthropicEffort = 'low' | 'medium' | 'high' | 'max';
 
@@ -68,7 +69,11 @@ export class AnthropicProvider implements LLMProvider {
         this.client = new Anthropic(opts);
     }
 
-    async *stream(request: LLMStreamRequest): AsyncIterable<LLMStreamEvent> {
+    stream(request: LLMStreamRequest): AsyncIterable<LLMStreamEvent> {
+        return withProviderRequestLifecycle(lifecycle => this.streamRequest({ ...request, signal: lifecycle.signal }), request.signal);
+    }
+
+    private async *streamRequest(request: LLMStreamRequest): AsyncIterable<LLMStreamEvent> {
         const diagnostics = createTransformDiagnostics('anthropic', request.messages.length);
         const transformed = transformMessages(request.messages, 'anthropic', diagnostics, request.model);
         if (hasTransformMutations(diagnostics)) {
@@ -134,8 +139,8 @@ export class AnthropicProvider implements LLMProvider {
             betas.push(...request.anthropicBetas.filter(b => !betas.includes(b)));
 
         const stream = betas.length > 0
-            ? this.client.beta.messages.stream({ ...params, betas } as any)
-            : this.client.messages.stream(params);
+            ? this.client.beta.messages.stream({ ...params, betas } as any, { signal: request.signal })
+            : this.client.messages.stream(params, { signal: request.signal });
         const contentBlocks = new Map<number, { type: string; id?: string; name?: string; signature?: string }>();
 
         for await (const event of stream) {
@@ -196,11 +201,15 @@ export class AnthropicProvider implements LLMProvider {
                 input: finalMessage.usage.input_tokens,
             }, '[ANTHROPIC] prompt cache');
         }
+        // Anthropic 的 input_tokens 不含 cache_read/cache_creation (三者互不相交)。
+        // 归一成"完整 prompt 规模"口径 (与 OpenAI prompt_tokens / Gemini promptTokenCount 一致),
+        // auto-compaction 的触发判定依赖该口径; 若只上报裸 input_tokens, 缓存命中轮会严重低估。
+        const fullPromptTokens = (finalMessage.usage.input_tokens ?? 0) + cacheRead + cacheWrite;
         yield {
             type: 'done',
             stopReason: finalMessage.stop_reason ?? 'end_turn',
             usage: {
-                inputTokens: finalMessage.usage.input_tokens,
+                inputTokens: fullPromptTokens,
                 outputTokens: finalMessage.usage.output_tokens,
                 cacheReadTokens: cacheRead || undefined,
                 cacheWriteTokens: cacheWrite || undefined,

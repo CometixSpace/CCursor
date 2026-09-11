@@ -1,6 +1,7 @@
-const WINDOWS_UNC_RE = /^(?:\\\\|\/\/)[^\\/]+[\\/][^\\/]+/;
+// Joining a child can turn a server-only prefix into a complete UNC share.
+const WINDOWS_UNC_RE = /^[\\/]{2}/;
 
-export function isUncPath(value: string): boolean {
+function isUncPath(value: string): boolean {
   return WINDOWS_UNC_RE.test(value);
 }
 
@@ -18,12 +19,12 @@ export function resolveToolPath(rawPath: unknown, _workspacePath?: string): stri
 }
 
 /**
- * Server-side preflight reads must not touch UNC paths. On Windows, stat/read on
+ * Server-side filesystem operations must not touch UNC paths. On Windows, IO on
  * an attacker-controlled UNC host may trigger SMB/NTLM authentication. Tools
  * that need server-side content computation should fail closed.
  */
 export function assertSafeForServerFs(filePath: string, operation: string): void {
   if (isUncPath(filePath)) {
-    throw new Error(`${operation} refused to access UNC path during server-side preflight: ${filePath}`);
+    throw new Error(`${operation} refused to access UNC path on the server: ${filePath}`);
   }
 }

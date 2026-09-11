@@ -167,7 +167,7 @@ export function applyNotebookEditToContent(
             cell_type: cellType,
             metadata: {},
             source: newString.split('\n').map((line, i, arr) =>
-                i < arr.length - 1 ? line + '\n' : line,
+                i < arr.length - 1 ? `${line}\n` : line,
             ),
             ...(cellType === 'code'
                 ? { execution_count: null, outputs: [] }
@@ -191,12 +191,12 @@ export function applyNotebookEditToContent(
 
         const newSource = currentSource.replace(oldString, newString);
         cell.source = newSource.split('\n').map((line: string, i: number, arr: string[]) =>
-            i < arr.length - 1 ? line + '\n' : line,
+            i < arr.length - 1 ? `${line}\n` : line,
         );
     }
 
     // 序列化时保持 ipynb 标准缩进（1 space）并以换行结尾
-    return JSON.stringify(nb, null, 1) + '\n';
+    return `${JSON.stringify(nb, null, 1)}\n`;
 }
 
 export const EditNotebookTool: ToolRegistryEntry = {

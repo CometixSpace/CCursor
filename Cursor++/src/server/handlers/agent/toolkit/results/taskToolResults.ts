@@ -1,3 +1,8 @@
+import { mkdirSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { getConversationSpillDir } from '../../../../config/paths';
+import { TASK_ENTRY_CAP_RATIO } from '../../constants';
+import { countTokens, sliceTextHeadTailTokens } from '../../tokenCounter';
 import {
     arr,
     bigintLike,
@@ -7,6 +12,89 @@ import {
     str,
     type ToolResultEnvelope,
 } from './shared';
+
+/**
+ * Task 报告入口截断上下文 — 由 run 循环从调用点传入。
+ *
+ * 缺失时 (管线不可达的旁路) 按固定 25K tok 处理 (258K 窗的 ENTRY_CAP 平价)。
+ */
+export interface TaskEntryTruncationContext {
+    conversationId: string;
+    contextTokenLimit?: number;
+    toolCallId: string;
+}
+
+/** ENTRY_CAP = min(25K tok, 25% × 窗口)。窗口不可知时按 100K 计 → 固定 25K。 */
+export const TASK_ENTRY_CAP_MAX_TOKENS = 25_000;
+const TASK_ENTRY_CAP_DEFAULT_WINDOW_TOKENS = 100_000;
+
+export function resolveTaskEntryCapTokens(contextTokenLimit?: number): number {
+    const window = contextTokenLimit !== undefined && contextTokenLimit > 0
+        ? contextTokenLimit
+        : TASK_ENTRY_CAP_DEFAULT_WINDOW_TOKENS;
+    return Math.min(TASK_ENTRY_CAP_MAX_TOKENS, Math.floor(TASK_ENTRY_CAP_RATIO * window));
+}
+
+/** toolCallId → 文件名安全形式 (call id 可能含 ':' 等 shell 不友好字符)。 */
+function toSpillFileName(toolCallId: string): string {
+    const safe = toolCallId.replace(/[^\w.-]+/g, '_');
+    return `${safe || 'task-call'}.txt`;
+}
+
+/**
+ * 截断前全文落盘 (spill)。写失败不阻塞主流程 — 返回 null,
+ * 调用方把截断标注降级为无路径版 (设计文档: 违反约束 6 比入口截断本身更糟,
+ * 故 spill 尽力而为, 失败时仍截断并声明原文未保存)。
+ */
+function spillTaskReportToFile(conversationId: string, toolCallId: string, fullText: string): string | null {
+    try {
+        const dir = getConversationSpillDir(conversationId);
+        mkdirSync(dir, { recursive: true });
+        const filePath = join(dir, toSpillFileName(toolCallId));
+        writeFileSync(filePath, fullText, 'utf8');
+        return filePath;
+    }
+    catch {
+        return null;
+    }
+}
+
+/**
+ * 入口截断: o200k 实测超 ENTRY_CAP → 头 70% + 尾 30% (token 预算),
+ * 截断标注含原始 token 数与 spill 文件路径 (可恢复性)。
+ */
+function truncateTaskReportForEntry(body: string, transcriptPath: string, entryContext?: TaskEntryTruncationContext): string {
+    const entryCapTokens = resolveTaskEntryCapTokens(entryContext?.contextTokenLimit);
+    const originalTokens = countTokens(body);
+    if (originalTokens <= entryCapTokens)
+        return body;
+
+    const headTokens = Math.floor(entryCapTokens * 0.7);
+    const tailTokens = Math.max(0, entryCapTokens - headTokens);
+    const { head, tail } = sliceTextHeadTailTokens(body, headTokens, tailTokens);
+
+    let spillPath: string | null = null;
+    if (entryContext?.conversationId)
+        spillPath = spillTaskReportToFile(entryContext.conversationId, entryContext.toolCallId, body);
+
+    const recoveryHints: string[] = [];
+    if (transcriptPath)
+        recoveryHints.push(`re-run Task or read the subagent transcript at ${transcriptPath}`);
+    if (spillPath)
+        recoveryHints.push(`full report saved to ${spillPath}`);
+    if (recoveryHints.length === 0)
+        recoveryHints.push('re-run the Task tool to regenerate the report (full text could not be saved)');
+
+    return [
+        `[Task report truncated at entry: original ${originalTokens} tokens exceeded cap ${entryCapTokens} tokens; head 70% + tail 30% retained]`,
+        `[To recover: ${recoveryHints.join('; ')}]`,
+        '--- head ---',
+        head,
+        '--- [middle elided] ---',
+        '--- tail ---',
+        tail,
+    ].filter(part => part !== '').join('\n');
+}
 
 function normalizeConversationStep(value: unknown): Record<string, unknown> {
     const step = obj(value);
@@ -152,7 +240,11 @@ export function normalizeTaskToolResult(resultCaseName: string, value: Record<st
     return null;
 }
 
-export function buildTaskToolResultText(resultCaseName: string, value: Record<string, unknown>): string | null {
+export function buildTaskToolResultText(
+    resultCaseName: string,
+    value: Record<string, unknown>,
+    entryContext?: TaskEntryTruncationContext,
+): string | null {
     if (resultCaseName === 'success') {
         const texts = arr<Record<string, unknown>>(value.conversationSteps)
             .map(extractConversationStepText)
@@ -169,15 +261,17 @@ export function buildTaskToolResultText(resultCaseName: string, value: Record<st
         const backgroundReason = optionalSubagentBackgroundReason(value.backgroundReason);
         if (backgroundReason !== undefined && backgroundReason !== 0) {
             const agentId = typeof value.agentId === 'string' ? value.agentId : '';
+            const pollingInstruction = agentId
+                ? `Use AwaitShell with task_id="${agentId}" to poll for completion.`
+                : 'Use AwaitShell with the agent id to poll for completion.';
             parts.push(
-                `[Task moved to background: ${subagentBackgroundReasonName(backgroundReason)}.`
-                + (agentId ? ` Use AwaitShell with task_id="${agentId}" to poll for completion.` : ' Use AwaitShell with the agent id to poll for completion.')
-                + ']',
+                `[Task moved to background: ${subagentBackgroundReasonName(backgroundReason)}. ${pollingInstruction}]`,
             );
         }
 
         const body = parts.join('\n\n').trim();
-        if (body) return body;
+        if (body)
+            return truncateTaskReportForEntry(body, transcriptPath, entryContext);
         return `Subagent completed${typeof value.agentId === 'string' ? `: ${value.agentId}` : ''}`;
     }
     if (resultCaseName) return `Task ${resultCaseName || 'error'}: ${JSON.stringify(value)}`;

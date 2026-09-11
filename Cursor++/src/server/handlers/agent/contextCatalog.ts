@@ -81,11 +81,15 @@ function normalizeRuleKind(value: string): ParsedCursorRule['kind'] {
   return 'unknown'
 }
 
+function extractFrontmatter(content: string): string | undefined {
+  return content.match(/^---[^\S\r\n]*\r?\n([\s\S]*?)\r?\n---/)?.[1]
+}
+
 export function extractSkillDescription(content: string): string {
-  const frontmatter = content.match(/^---\s*\n([\s\S]*?)\n---/)
-  if (!frontmatter)
+  const frontmatter = extractFrontmatter(content)
+  if (frontmatter === undefined)
     return content.trim().slice(0, 120)
-  const description = frontmatter[1].match(/^description:\s*(.+)$/m)
+  const description = frontmatter.match(/^description:([^\r\n]*)/m)
   return description ? description[1].trim() : content.trim().slice(0, 120)
 }
 
@@ -326,8 +330,8 @@ export function categorizeCursorRules(params: {
 }
 
 function skillDisablesModelInvocation(content: string): boolean {
-  const frontmatter = content.match(/^---\s*\n([\s\S]*?)\n---/)
-  return !!frontmatter && /^disable-model-invocation:\s*true\s*$/mi.test(frontmatter[1])
+  const frontmatter = extractFrontmatter(content)
+  return frontmatter !== undefined && /^disable-model-invocation:\s*true\s*$/mi.test(frontmatter)
 }
 
 export function mergeAgentSkills(

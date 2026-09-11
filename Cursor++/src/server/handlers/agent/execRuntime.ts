@@ -54,6 +54,8 @@ export async function* finalizeExecTool(params: {
     messages: LLMMessage[];
     imageCollector?: LLMContentBlock[];
     readContext?: ReadContextState;
+    /** Task 报告入口截断上下文 — 仅 taskToolCall 路径传入 */
+    entryTruncation?: import('./toolkit/results/taskToolResults').TaskEntryTruncationContext;
 }): AsyncGenerator<AgentServerMessage, AgentServerMessage, void> {
     let toolResult: ToolResultEnvelope = { result: { case: 'error', value: { message: 'no result' } } };
     let completedFrame: AgentServerMessage | null = null;
@@ -206,6 +208,7 @@ export async function* finalizeExecTool(params: {
                 input: params.input,
                 modelCallId: params.modelCallId,
                 readContext: params.readContext,
+                entryTruncation: params.entryTruncation,
             });
             toolResult = finalized.toolResult;
             completedFrame = finalized.frame;

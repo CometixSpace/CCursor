@@ -7,7 +7,7 @@ export {
     heartbeat, translateStream, checkpoint, kvMessage, kvGetBlob,
     partialToolCall, toolCallStarted, toolCallCompleted, execMessage,
 } from './stream';
-export { getOrCreateSession, waitForMessage, waitForMessageMatching, appendMessage, closeSession } from './session';
+export { getOrCreateSession, waitForMessageMatching, appendMessage, closeSession } from './session';
 export { rebuildMessagesFromBlobs, blobToMessage, messageToBlob } from './conversation';
-export { cacheBlob, getCachedBlob, getCachedBlobsAsMessages } from './blobStore';
+export { RunBlobStore } from './blobStore';
 export { mapToolName, mapToolToExecArgs, buildExecArgs } from './tools';

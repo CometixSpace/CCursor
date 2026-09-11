@@ -4,31 +4,30 @@ import type { ParsedRunRequest } from './protocol'
 import type { AgentSession } from './session'
 import type { ToolCallInfo } from './tools'
 import { resolveExecutionToolName } from './tools'
-import { clearDraftCheckpoint, persistConversationCheckpoint } from '../../database/checkpoints'
+import { CheckpointConflictError } from '../../database/checkpoints'
 import { logger } from '../../logger'
 import { resolveProviderRuntime } from '../llm'
-import { decodeBlob } from './blob'
-import { cacheBlob, getCachedBlob } from './blobStore'
-import { emitFinalCheckpoint, emitRollingCheckpoint } from './checkpointManager'
+import { emitFinalCheckpoint, emitRollingCheckpoint, throwIfBlobRunInactive } from './checkpointManager'
+import { BlobIntegrityError } from './blobErrors'
 import { ContextTokenTracker } from './tokenCounter'
-import { createCompactionArtifacts, estimateMessagesTokens, formatMessageForSummary, planCompaction } from './compactionStrategy'
-import { extractPlainTextContent, flushMessageBlobs, hydrateHistoryEntries, rebuildConversationHistory, repairHistoryEntries, sendAndCacheBlob } from './historyManager'
+import { estimateMessagesTokens, measureMessagesTokens, planCompaction } from './compactionStrategy'
+import { executeCompaction, waitForRunCompactionLockRelease } from './compactionExecution'
+import { getCompactionContentionCount, isCompactionLockHeld, releaseCompactionLock, tryAcquireCompactionLock } from './compactionLock'
+import { extractPlainTextContent, materializeHistoryEntries, rebuildConversationHistory, repairHistoryEntries, retainMessageBlob, retainMessageBlobs } from './historyManager'
 import { buildMessages, workspaceUris } from './protocol'
-import { checkpoint, editToolCallStreamDelta, heartbeat, kvMessage, partialToolCall, summary, summaryCompleted, summaryStarted, translateStream, userMessageAppended } from './stream'
-import { buildSummaryUserMessage, SUMMARY_SYSTEM_PROMPT } from './summaryPrompt'
+import { checkpoint, editToolCallStreamDelta, heartbeat, partialToolCall, summaryCompleted, summaryStarted, translateStream, userMessageAppended } from './stream'
 import { finalizeTaskResult, launchTaskTool, runToolCall, type TaskLaunchContext } from './toolRuntime'
-import { awaitExecResultAndClose, waitForPromiseWithHeartbeat } from './wait'
-import { restoreBlobMessageToLLMMessage } from './transcript'
-import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, readTurnBaseline } from './turnTracker'
+import { awaitExecResultAndClose, isAgentRunAbortedError, waitForPromiseWithHeartbeat } from './wait'
+import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, ensureTurnBlobCached, probeTurnDynamicToolCount, readTurnBaseline, type EncodedBlob } from './turnTracker'
+import { restoreRequiredBlobGraph } from './requiredBlobGraph'
+import type { BlobRunContext } from './runContext'
 import { contextualizeDynamicMetaTools, partitionCursorBuiltinTools, shouldEnableBuiltinDynamicProfile } from './dynamicTools'
 import { contextualizeSubagentTools } from './subagentCatalog'
-import { addUsage, clampTokenDetails, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold, shouldTriggerCompaction } from './usage'
-import { isAgentRunAbortedError, throwIfSessionCancelled } from './wait'
+import { addUsage, AUTOCOMPACT_NET_GROWTH_MIN_TOKENS, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold, isContextLengthLimitError, shouldTriggerCompaction } from './usage'
+import { CONTEXT_LENGTH_RETRY_MAX } from './constants'
 import { isSessionCancelled } from './session'
 import { makeProviderError, makeToolError } from '../errors'
 import { createRepairDiagnostics, hasRepairMutations, repairConversationHistory } from '../llm/transformMessages'
-
-const LEADING_DASH_RE = /^-\s*/
 
 const EDIT_TOOL_NAMES = new Set(['ApplyPatch', 'Edit', 'Write', 'EditNotebook'])
 
@@ -246,7 +245,7 @@ export function detectEditPathFromToolInput(toolName: string, rawInput: string):
   const m = rawInput.match(new RegExp(`"${pathKey}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`))
   if (m?.[1]) return decodeJsonStringFragment(m[1])
   if (toolName === 'ApplyPatch') {
-    const p = rawInput.match(/\*\*\*\s+(?:Update|Add|Delete)\s+File:\s+(.+?)(?:\\n|\n)/)
+    const p = rawInput.match(/\*\*\*\s+(?:Update|Add|Delete)\s+File:([^\r\n]*?)(?:\\n|\r?\n)/)
     if (p?.[1]) return p[1].trim()
   }
   return ''
@@ -347,7 +346,7 @@ function decodeEscape(ch: string): string {
     case '"': return '"'
     case '/': return '/'
     case 'r': return '\r'
-    default: return '\\' + ch
+    default: return `\\${ch}`
   }
 }
 
@@ -419,19 +418,10 @@ function editToolTargetStats(toolName: string, input: Record<string, unknown>): 
   return stats
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
-}
-
-function cacheAndBuildKvBlob(id: number, blob: { blobId: string; blobData: string; blobDataRaw?: Uint8Array }): AgentServerMessage {
-  cacheBlob(blob.blobId, blob.blobData)
-  return kvMessage(id, blob.blobId, blob.blobData, blob.blobDataRaw)
-}
-
-function recordAssistantBlocksIntoTurn(turn: ActiveTurnTracker | null, blocks: LLMContentBlock[]): Array<{ blobId: string, blobData: string }> {
+function recordAssistantBlocksIntoTurn(turn: ActiveTurnTracker | null, blocks: LLMContentBlock[]): EncodedBlob[] {
   if (!turn)
     return []
-  const emitted: Array<{ blobId: string, blobData: string }> = []
+  const emitted: EncodedBlob[] = []
   for (const block of blocks) {
     if (block.type === 'thinking') {
       const blob = turn.addThinking(block.text)
@@ -446,6 +436,14 @@ function recordAssistantBlocksIntoTurn(turn: ActiveTurnTracker | null, blocks: L
     }
   }
   return emitted
+}
+
+function isRunStateError(error: unknown): boolean {
+  return error instanceof CheckpointConflictError || error instanceof BlobIntegrityError || (error instanceof Error && (
+    error.name === 'BlobIntegrityError'
+    || error.name === 'BlobTransferError'
+    || error.name === 'BlobResourceLimitError'
+  ))
 }
 
 function extractCompletedToolCall(frame: AgentServerMessage) {
@@ -494,6 +492,29 @@ function flushPendingAssistantPrefix(params: {
   return { currentThinking, currentText }
 }
 
+interface InlineCompactionParams {
+  run: BlobRunContext
+  parsed: ParsedRunRequest
+  allBlobIds: string[]
+  turnBlobIds: string[]
+  summaryArchiveIds: string[]
+  usedTokensEstimate: number
+  contextTokenLimit: number
+  messages: LLMMessage[]
+  route: ReturnType<typeof resolveProviderRuntime>
+  readPaths: string[]
+  budgetOverride?: number
+}
+
+interface InlineCompactionResult {
+  newBlobIds: string[]
+  newSummaryArchiveIds: string[]
+  newUsedTokens: number
+  newMessages: LLMMessage[]
+  /** Base budget used by subsequent context-length retries. */
+  baseBudgetTokens: number
+}
+
 /**
  * 在 Agent Run 流内执行 inline auto-summarize。
  *
@@ -510,117 +531,108 @@ function flushPendingAssistantPrefix(params: {
  * 7. yield summaryCompleted — 通知客户端 summarize 完成
  * 8. 返回 compacted 状态供后续 round 继续使用
  */
-async function* performInlineAutoSummarize(params: {
-  parsed: ParsedRunRequest
-  allBlobIds: string[]
-  summaryArchiveIds: string[]
-  usedTokensEstimate: number
-  contextTokenLimit: number
-  messages: LLMMessage[]
-  route: ReturnType<typeof resolveProviderRuntime>
-  readPaths: string[]
-}): AsyncGenerator<AgentServerMessage, {
-  newBlobIds: string[]
-  newSummaryArchiveIds: string[]
-  newUsedTokens: number
-  newMessages: LLMMessage[]
-} | null> {
-  const { parsed, allBlobIds, summaryArchiveIds, usedTokensEstimate, contextTokenLimit, route } = params
+async function* performInlineAutoSummarize(
+  params: InlineCompactionParams,
+): AsyncGenerator<AgentServerMessage, InlineCompactionResult | 'lock-held' | null> {
+  const { parsed, run } = params
+  throwIfBlobRunInactive(run)
 
-  const historyEntries = repairHistoryEntries(hydrateHistoryEntries(allBlobIds))
+  // 并发互斥 (设计文档 §7#7): inline 触发时锁被占 → 本轮跳过, 下轮重试。
+  // F5 修正 (2026-08-29 实弹): 返回 'lock-held' 哨兵而非 null —
+  // 锁被占意味着另一路压缩正在进行, 不是压缩失败, 不得计入熔断计数
+  // (实弹曾观测: 慢摘要占锁 → 并发 run 三连撞锁 → 熔断误开 → 压缩被永久关停)。
+  if (!tryAcquireCompactionLock(parsed.conversationId)) {
+    logger.warn({
+      conversationId: parsed.conversationId,
+      contentionCount: getCompactionContentionCount(parsed.conversationId),
+    }, '[AUTOCOMPACT] compaction lock held (another compaction in flight) — skipping this round without counting failure')
+    return 'lock-held'
+  }
+  try {
+    return yield* performInlineAutoSummarizeLocked(params)
+  }
+  finally {
+    releaseCompactionLock(parsed.conversationId)
+  }
+}
+
+async function* performInlineAutoSummarizeLocked(
+  params: InlineCompactionParams,
+): AsyncGenerator<AgentServerMessage, InlineCompactionResult | null> {
+  const { parsed, run, allBlobIds, turnBlobIds, summaryArchiveIds, usedTokensEstimate, contextTokenLimit, route } = params
+
+  const historyEntries = repairHistoryEntries(materializeHistoryEntries(params.messages, run.blobs), run.blobs)
   if (historyEntries.length === 0)
     return null
 
-  const compactionPlan = planCompaction(historyEntries)
+  const compactionPlan = planCompaction(historyEntries, {
+    contextTokenLimit,
+    budgetOverride: params.budgetOverride,
+  })
+
+  // 小窗结构性不可行终态: 停用自动压缩并告警 (拒动为合格终态, 设计文档 #10)
+  if (compactionPlan.mode === 'disabled') {
+    logger.error({
+      conversationId: parsed.conversationId,
+      contextTokenLimit,
+      diagnostics: compactionPlan.diagnostics,
+    }, '[AUTOCOMPACT] planCompaction disabled — skipping compaction (see guidance above)')
+    return null
+  }
+
   if (compactionPlan.summarizeEntries.length === 0) {
     logger.info({ conversationId: parsed.conversationId }, '[AGENT] auto-summarize: nothing to compact')
     return null
   }
 
+  // keepTail 构成观测: 占位命中数 / 实占 token / 前沿超额 / 违约与升级链事件
+  const planDiagnostics = compactionPlan.diagnostics
+  const keepTailEntries = compactionPlan.keepTail.map(entry => ({
+    role: entry.message.role,
+    toolName: entry.message.toolName,
+    isPlaceholder: typeof entry.message.content === 'string'
+      ? entry.message.content.includes('[tool output elided during context compaction')
+      : false,
+    tokens: measureMessagesTokens([entry.message]),
+  }))
   logger.info({
     conversationId: parsed.conversationId,
+    compactionStartedAt: new Date().toISOString(),
     totalEntries: historyEntries.length,
     summarizeCount: compactionPlan.summarizeEntries.length,
     keepTailCount: compactionPlan.keepTail.length,
     leadingCount: compactionPlan.leading.length,
+    keepTailTokens: keepTailEntries,
+    placeholderHits: planDiagnostics.placeholderCount,
+    inputElidedCount: planDiagnostics.inputElidedCount,
+    anchorInserted: planDiagnostics.anchorInserted,
+    escalationLevel: planDiagnostics.escalationLevel,
+    floorViolation: planDiagnostics.floorViolation,
+    frontierExcessTokens: planDiagnostics.frontierExcessTokens,
+    firstConsumptionLossCount: planDiagnostics.firstConsumptionLossCount,
+    budgetTokens: planDiagnostics.budgetTokens,
+    largeEntryLineTokens: planDiagnostics.largeEntryLineTokens,
     usedTokensEstimate,
     contextTokenLimit,
+    aggressiveRetry: params.budgetOverride !== undefined,
   }, '[AGENT] auto-summarize: starting inline compaction')
 
   yield summaryStarted()
+  throwIfBlobRunInactive(run)
 
-  const summarySourceText = compactionPlan.summarizeEntries
-    .map(entry => formatMessageForSummary(entry.message))
-    .filter(text => text.length > 0)
-    .join('\n\n')
-
-  let summaryText = ''
-  try {
-    const llmStream = route.provider.stream({
-      model: route.model,
-      thinking: false,
-      messages: [
-        { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
-        { role: 'user', content: buildSummaryUserMessage(summarySourceText) },
-      ],
-    })
-
-    for await (const event of llmStream) {
-      if (event.type === 'text_delta') {
-        summaryText += event.text
-        yield summary(event.text)
-      }
-    }
-  }
-  catch (error) {
-    logger.warn({ error: (error as Error).message }, '[AGENT] auto-summarize: LLM failed, using local fallback')
-  }
-
-  summaryText = summaryText.trim()
-  if (!summaryText) {
-    summaryText = summarySourceText
-      .split('\n')
-      .map(line => line.trim())
-      .filter(Boolean)
-      .slice(0, 12)
-      .map(line => `- ${line.replace(LEADING_DASH_RE, '')}`)
-      .join('\n')
-      .slice(0, 4000)
-  }
-  if (!summaryText) {
-    summaryText = '- Prior conversation compacted.'
-  }
-
-  const artifacts = createCompactionArtifacts({
-    plan: compactionPlan,
-    summaryText,
-    previousSummaryArchiveIds: summaryArchiveIds,
-  })
-
-  yield kvMessage(1, artifacts.summaryBlobId, artifacts.summaryBlobData)
-  for (const [index, archiveBlob] of artifacts.archiveBlobs.entries()) {
-    yield kvMessage(2 + index, archiveBlob.blobId, archiveBlob.blobData, archiveBlob.blobDataRaw)
-  }
-
-  const compactedTokenDetails = clampTokenDetails(
-    estimateMessagesTokens([
-      ...compactionPlan.leading.map(entry => entry.message),
-      { role: 'assistant', content: `Previous conversation summary:\n${artifacts.summaryText}` },
-      ...compactionPlan.keepTail.map(entry => entry.message),
-    ]),
-    contextTokenLimit,
-  )
-
-  persistConversationCheckpoint({ kind: 'committed',
+  const { artifacts, tokenDetails: compactedTokenDetails } = yield* executeCompaction({
+    run,
     conversationId: parsed.conversationId,
-    rootBlobIds: artifacts.nextRootBlobIds,
-    turnBlobIds: parsed.historyTurnBlobIds,
-    summaryArchiveIds: artifacts.nextSummaryArchiveIds,
-    tokenDetails: compactedTokenDetails,
+    origin: 'inline',
+    plan: compactionPlan,
+    route,
+    contextTokenLimit,
+    turnBlobIds,
+    previousSummaryArchiveIds: summaryArchiveIds,
     mode: parsed.mode,
-    updatedAt: Date.now(),
   })
 
+  throwIfBlobRunInactive(run)
   yield checkpoint(
     artifacts.nextRootBlobIds,
     compactedTokenDetails.usedTokens,
@@ -628,7 +640,7 @@ async function* performInlineAutoSummarize(params: {
     parsed.mode,
     undefined,
     {
-      turnBlobIds: parsed.historyTurnBlobIds,
+      turnBlobIds,
       summaryArchiveIds: artifacts.nextSummaryArchiveIds,
       workspaceUris: workspaceUris(parsed),
       readPaths: params.readPaths,
@@ -637,24 +649,11 @@ async function* performInlineAutoSummarize(params: {
     },
   )
 
+  throwIfBlobRunInactive(run)
   yield summaryCompleted('Chat context summarized.')
 
   // 重建 compacted 后的 messages 数组供后续 round 使用
-  const newMessages: LLMMessage[] = []
-  for (const blobId of artifacts.nextRootBlobIds) {
-    const blobData = getCachedBlob(blobId)
-    if (!blobData)
-      continue
-    try {
-      const decoded = decodeBlob(blobData)
-      if (decoded && typeof decoded === 'object') {
-        const restored = restoreBlobMessageToLLMMessage(decoded as Record<string, unknown>)
-        if (restored)
-          newMessages.push(restored)
-      }
-    }
-    catch {}
-  }
+  const newMessages = artifacts.rootEntries.map(entry => entry.message)
   const repairDiagnostics = createRepairDiagnostics(newMessages.length)
   const repairedNewMessages = repairConversationHistory(newMessages, repairDiagnostics)
   if (hasRepairMutations(repairDiagnostics)) {
@@ -679,19 +678,33 @@ async function* performInlineAutoSummarize(params: {
     newSummaryArchiveIds: artifacts.nextSummaryArchiveIds,
     newUsedTokens: compactedTokenDetails.usedTokens,
     newMessages: repairedNewMessages,
+    baseBudgetTokens: compactionPlan.diagnostics.budgetTokens,
   }
 }
 
 export async function* handleConversationRun(
   parsed: ParsedRunRequest,
   session: AgentSession | null,
+  run: BlobRunContext,
 ): AsyncIterable<AgentServerMessage> {
+  throwIfBlobRunInactive(run)
   const route = resolveProviderRuntime(parsed.modelId)
   const requestedContextTokenLimit = parsed.contextTokenLimit
   if (parsed.contextTokenLimit === undefined) {
     parsed.contextTokenLimit = route.contextTokenLimit
   }
   const contextTokenLimit = parsed.contextTokenLimit ?? route.contextTokenLimit
+  // contextTokenLimit<=0 (providers.json 未配置 context 且客户端未下发 parameters.context)
+  // 会使阈值变负 -> shouldTriggerCompaction 恒真 -> 每个工具轮都压缩。显式禁用并告警。
+  const autoCompactEnabled = contextTokenLimit > 0
+  if (!autoCompactEnabled) {
+    logger.warn({
+      conversationId: parsed.conversationId,
+      modelId: parsed.modelId,
+      routeContextTokenLimit: route.contextTokenLimit,
+      requestedContextTokenLimit,
+    }, '[AGENT] auto-compact disabled: non-positive contextTokenLimit — configure providers.json context or send parameters.context')
+  }
   logger.debug({
     conversationId: parsed.conversationId,
     modelId: parsed.modelId,
@@ -709,10 +722,17 @@ export async function* handleConversationRun(
   if (!parsed.readLintsEnabled)
     disabledToolsForRun.add('ReadLints')
 
-  const previousDynamicToolCount = [...parsed.historyTurnBlobIds]
-    .reverse()
-    .map(turnBlobId => readTurnBaseline(turnBlobId)?.dynamicToolCount)
-    .find(count => count !== undefined)
+  // Resume re-encodes this turn. Ordinary continuation only probes a tool hint.
+  const latestTurnBlobId = parsed.historyTurnBlobIds.at(-1)
+  if (parsed.isResume && latestTurnBlobId !== undefined) {
+    yield* ensureTurnBlobCached(latestTurnBlobId, run)
+    yield* restoreRequiredBlobGraph(run, [{ blobId: latestTurnBlobId, kind: 'turn' }])
+  }
+  const previousDynamicToolCount = latestTurnBlobId !== undefined
+    ? parsed.isResume
+      ? readTurnBaseline(latestTurnBlobId, run.blobs).dynamicToolCount
+      : yield* probeTurnDynamicToolCount(latestTurnBlobId, run)
+    : undefined
   // 官方 dynamicToolProfile 缺省 all-static；显式 capability、meta-MCP 或同一
   // 会话已经启用过 dynamic profile 时继续 final。后两者覆盖不带 context 的
   // background-completion/resume 请求，避免工具集在相邻轮间来回抖动。
@@ -854,8 +874,7 @@ export async function* handleConversationRun(
 
   let breakdownCategories: BreakdownCategory[] | undefined
 
-  let blobCounter = 0
-  let interactionIdCounter = 1
+  let execMessageIdCounter = 0
   let blobIds: string[] = []
   let turnBlobIds = [...parsed.historyTurnBlobIds]
   let messages: LLMMessage[] = []
@@ -864,6 +883,12 @@ export async function* handleConversationRun(
   // 不再用 autoSummarizePerformed 一次性限制——每轮都可重复触发,直至连续失败 3 次停止
   let autoCompactConsecutiveFailures = 0
   const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
+  // 上次"有效"压缩后的估算基线; 净增长门槛的参照点 (0 = 本 run 尚未压缩过)
+  let lastCompactionBaseline = 0
+  // 错误驱动压缩重试计数 (≤3 轮硬封顶) 与首次压缩基准预算 (budget/2^retry 的被除数)
+  let contextLengthRetryCount = 0
+  let baseKeepTailBudget = 0
+  let firstCompactionAt = 0
   const syntheticUserMessageId = parsed.isBackgroundTaskCompletion
     ? `background-completion-${Date.now()}`
     : parsed.rawUserMessage?.messageId && typeof parsed.rawUserMessage.messageId === 'string'
@@ -871,16 +896,24 @@ export async function* handleConversationRun(
       : `turn-${Date.now()}`
   let activeTurn: ActiveTurnTracker | null = null
 
-  const sendSystemScaffoldBlob = function* (
+  const sendSystemScaffoldBlob = (
     data: { role: string, content: unknown, toolCallId?: string, toolName?: string, isError?: boolean },
-  ): Generator<AgentServerMessage, void, void> {
-    yield* sendAndCacheBlob(kvMessage, 0, data, blobIds)
+  ): void => {
+    retainMessageBlob(run.blobs, data, blobIds)
   }
 
-  const sendOrderedBlob = function* (
+  const sendOrderedBlob = (
     data: { role: string, content: unknown, toolCallId?: string, toolName?: string, isError?: boolean },
-  ): Generator<AgentServerMessage, void, void> {
-    yield* sendAndCacheBlob(kvMessage, ++blobCounter, data, blobIds)
+  ): void => {
+    retainMessageBlob(run.blobs, data, blobIds)
+  }
+
+  const retainCurrentTurnBlob = (): string[] => {
+    const turnBlob = activeTurn?.materializeTurnBlob()
+    if (!turnBlob)
+      return [...turnBlobIds]
+    run.blobs.cacheBlob(turnBlob.blobId, turnBlob.blobData, turnBlob.blobDataRaw, turnBlob.dependencies)
+    return [...turnBlobIds, turnBlob.blobId]
   }
 
   yield heartbeat()
@@ -918,15 +951,10 @@ export async function* handleConversationRun(
 
   if (parsed.isResume) {
     if (turnBlobIds.length > 0) {
-      const resumed = ActiveTurnTracker.fromTurnBlobId(turnBlobIds[turnBlobIds.length - 1]!)
-      if (resumed) {
-        resumed.setDynamicToolCount(parsed.dynamicToolCount)
-        activeTurn = resumed
-        turnBlobIds = turnBlobIds.slice(0, -1)
-      }
-      else {
-        logger.warn({ conversationId: parsed.conversationId, lastTurnBlobId: turnBlobIds[turnBlobIds.length - 1] }, '[TURN] failed to resume last turn baseline; future checkpoints will omit turns for this resume')
-      }
+      const resumed = ActiveTurnTracker.fromTurnBlobId(turnBlobIds[turnBlobIds.length - 1]!, run.blobs)
+      resumed.setDynamicToolCount(parsed.dynamicToolCount)
+      activeTurn = resumed
+      turnBlobIds = turnBlobIds.slice(0, -1)
     }
   }
   else {
@@ -935,9 +963,10 @@ export async function* handleConversationRun(
       fallbackMessageId: syntheticUserMessageId,
     })
     activeTurn = new ActiveTurnTracker(blob.blobId, [], messageId, parsed.dynamicToolCount)
-    yield cacheAndBuildKvBlob(++blobCounter, blob)
+    run.blobs.cacheBlob(blob.blobId, blob.blobData, blob.blobDataRaw, blob.dependencies)
   }
 
+  // 历史 blob: 内存未命中的经 getBlobArgs 向客户端取 (客户端是唯一持久持有方)
   const rebuiltHistory = yield* rebuildConversationHistory({
     historyBlobIds: parsed.historyBlobIds,
     prependUserMessages: parsed.prependUserMessages,
@@ -948,14 +977,15 @@ export async function* handleConversationRun(
     preambleUserContent,
     sendSystemScaffoldBlob,
     sendOrderedBlob,
+    run,
   })
   messages = rebuiltHistory.messages
 
   for (const text of rebuiltHistory.insertedPrependUserTexts) {
-    yield* sendOrderedBlob({ role: 'user', content: text })
+    sendOrderedBlob({ role: 'user', content: text })
   }
 
-  yield* sendOrderedBlob({ role: 'user', content: currentUserContentRaw })
+  sendOrderedBlob({ role: 'user', content: currentUserContentRaw })
   let nextBlobbedMessageIndex = messages.length
 
   const userPreview = parsed.isExecutePlan && parsed.executePlanContent
@@ -964,17 +994,33 @@ export async function* handleConversationRun(
   logger.info(`[AGENT] → [${route.provider.name}/${route.model}] "${userPreview}" (${messages.length} msgs)`)
 
   const usageTotals = emptyUsageTotals()
-  let usedTokensEstimate = Math.max(
-    parsed.historyTokenDetails?.usedTokens ?? 0,
-    estimateMessagesTokens(messages),
-  )
+  // 估算来源归因: 记录 usedTokensEstimate 当前由哪把尺子顶到该值
+  // ('client-inherited' = 客户端回传的 checkpoint 值 | 'chars/4' | 'provider')
+  let estimateSource: 'client-inherited' | 'chars/4' | 'provider' = 'chars/4'
+  const clientInheritedTokens = parsed.historyTokenDetails?.usedTokens ?? 0
+  const charsInitTokens = estimateMessagesTokens(messages)
+  if (clientInheritedTokens > 0 && clientInheritedTokens >= charsInitTokens)
+    estimateSource = 'client-inherited'
+  let usedTokensEstimate = Math.max(clientInheritedTokens, charsInitTokens)
+  logger.info({
+    conversationId: parsed.conversationId,
+    isSubagent: parsed.isSubagent,
+    historyTokenDetails: parsed.historyTokenDetails,
+    routeContextTokenLimit: route.contextTokenLimit,
+    contextTokenLimit,
+    clientInheritedTokens,
+    charsInitTokens,
+    initialEstimate: usedTokensEstimate,
+    estimateSource,
+    autoCompactEnabled,
+  }, '[AUTOCOMPACT] run start baseline')
   let lastAssistantContent: LLMContentBlock[] | undefined
   let stepCounter = 0
 
   for (let round = 0; ; round++) {
     // 轮次边界的中断检查 —— 上一轮工具刚跑完时客户端可能已经中断,
     // 此处拦下可避免白发一次 LLM 请求
-    if (session && isSessionCancelled(session)) {
+    if (session && (isSessionCancelled(session) || session.closed)) {
       logger.info({
         conversationId: parsed.conversationId,
         round,
@@ -1034,9 +1080,8 @@ export async function* handleConversationRun(
         llmVisibleMcpToolsCount: llmVisibleMcpTools.length,
       }, '[AGENT] prepared provider conversation')
 
-      const llmStream = route.provider.stream(preparedRequest.request)
-
-      const translatedFrames = translateStream(llmStream, String(++stepCounter), (event) => {
+      throwIfBlobRunInactive(run)
+      const translatedFrames = translateStream(signal => route.provider.stream({ ...preparedRequest.request, signal }), String(++stepCounter), (event) => {
         switch (event.type) {
           case 'thinking_delta':
             currentThinking += event.text
@@ -1145,32 +1190,55 @@ export async function* handleConversationRun(
             }
             break
           }
-          case 'done':
+          case 'done': {
             ({ currentThinking, currentText } = flushPendingAssistantPrefix({
               roundAssistantBlocks,
               currentThinking,
               currentText,
             }))
             Object.assign(usageTotals, addUsage(usageTotals, event.usage))
-            usedTokensEstimate = Math.max(usedTokensEstimate, estimateContextTokens(event.usage))
+            const estimateBefore = usedTokensEstimate
+            const providerEstimate = estimateContextTokens(event.usage)
+            if (providerEstimate > usedTokensEstimate)
+              estimateSource = 'provider'
+            usedTokensEstimate = Math.max(usedTokensEstimate, providerEstimate)
+            // 尺子差观测点: inputTokens(全量,含脚手架) 与 chars/4(仅对话消息) 的差
+            // 即"脚手架 + tokenizer 偏差"的实测值, 用于校准压缩重置的自校准补偿
+            const charsEstimate = estimateMessagesTokens(messages)
+            logger.info({
+              conversationId: parsed.conversationId,
+              round,
+              inputTokens: event.usage.inputTokens,
+              outputTokens: event.usage.outputTokens,
+              cacheReadTokens: event.usage.cacheReadTokens ?? 0,
+              cacheWriteTokens: event.usage.cacheWriteTokens ?? 0,
+              providerEstimate,
+              charsEstimate,
+              scaffoldDelta: Math.max(0, (event.usage.inputTokens ?? 0) - charsEstimate),
+              estimateBefore,
+              estimateAfter: usedTokensEstimate,
+              estimateSource,
+            }, '[AUTOCOMPACT] provider usage latch')
             break
+          }
         }
       }, undefined, (event) => {
         if (event.type === 'tool_use_start')
           return `${parsed.conversationId}-${round}-${event.id.slice(-4)}`
-      })
+      }, run.signal)
 
       for await (const frame of translatedFrames) {
         // LLM 流是一轮里最长的一段停留,中断多半落在这里。逐帧检查把中断
         // 粒度收敛到单个事件 (thinking_delta 级,毫秒量级)。抛出后由下方
         // catch 的 isAgentRunAbortedError 分支干净收尾,半截的
         // roundAssistantBlocks 一并丢弃,不污染历史。
-        if (session)
-          throwIfSessionCancelled(session)
+        throwIfBlobRunInactive(run)
         yield frame
       }
     }
     catch (e) {
+      if (run.signal.aborted && e instanceof Error && e.name === 'AbortError')
+        throw e
       // 客户端主动中断不是错误 —— 必须先于 makeProviderError 拦下,
       // 否则会被包成 ErrorDetails,在客户端渲染出一条 retry banner:
       // 用户只是发了新消息抢占当前生成,却看到"上一条失败了"。
@@ -1182,6 +1250,80 @@ export async function* handleConversationRun(
         }, '[CANCEL] LLM stream aborted by client')
         return
       }
+      if (isRunStateError(e))
+        throw e
+
+      // 错误驱动压缩重试 (设计文档 §4 运行时层, 官方 CC-001/017):
+      // provider 报 context-length 类错误 → aggressive 压缩 (预算 /2^retry)
+      // → 重发本轮请求, ≤3 轮硬封顶; 非白名单错误走现状路径。
+      if (autoCompactEnabled && isContextLengthLimitError(e) && contextLengthRetryCount < CONTEXT_LENGTH_RETRY_MAX) {
+        contextLengthRetryCount += 1
+        // aggressive 预算: 基准预算 / 2^retry (未压缩过时按 targetFloor 估计基准)
+        const effectiveBaseBudget = baseKeepTailBudget > 0
+          ? baseKeepTailBudget
+          : Math.floor(0.25 * contextTokenLimit)
+        const aggressiveBudget = Math.max(1, Math.floor(effectiveBaseBudget / 2 ** contextLengthRetryCount))
+        logger.warn({
+          conversationId: parsed.conversationId,
+          round,
+          retry: contextLengthRetryCount,
+          maxRetries: CONTEXT_LENGTH_RETRY_MAX,
+          aggressiveBudget,
+          error: (e as Error).message,
+        }, '[AUTOCOMPACT] context-length error — retrying with aggressive compaction')
+        let retryCompactionResult = yield* performInlineAutoSummarize({
+          run,
+          parsed,
+          allBlobIds: [...parsed.historyBlobIds, ...blobIds],
+          turnBlobIds: retainCurrentTurnBlob(),
+          summaryArchiveIds: currentSummaryArchiveIds,
+          usedTokensEstimate,
+          contextTokenLimit,
+          messages,
+          route,
+          readPaths: [...readContext.readPaths],
+          budgetOverride: aggressiveBudget,
+        })
+        if (retryCompactionResult === 'lock-held') {
+          // 上下文已爆窗, 唯一出路是压缩 — 学官方 WaitForCompletion 形态纯等
+          // 持锁压缩完成 (无 deadline; 持锁者有界性由 idle 超时 + 兜底梯子保证),
+          // 心跳保 SSE 活性, 释放后用本 run 视图重压一次
+          logger.warn({
+            conversationId: parsed.conversationId,
+            round,
+            retry: contextLengthRetryCount,
+          }, '[AUTOCOMPACT] context-length retry blocked by in-flight compaction — waiting for lock release')
+          while (isCompactionLockHeld(parsed.conversationId))
+            yield* waitForRunCompactionLockRelease(parsed.conversationId, run)
+          const secondAttempt = yield* performInlineAutoSummarize({
+            run,
+            parsed,
+            allBlobIds: [...parsed.historyBlobIds, ...blobIds],
+            turnBlobIds: retainCurrentTurnBlob(),
+            summaryArchiveIds: currentSummaryArchiveIds,
+            usedTokensEstimate,
+            contextTokenLimit,
+            messages,
+            route,
+            readPaths: [...readContext.readPaths],
+            budgetOverride: aggressiveBudget,
+          })
+          retryCompactionResult = secondAttempt === 'lock-held' ? null : secondAttempt
+        }
+        // 至此 'lock-held' 已被上方分支消解 (TS 控制流可证), 仅剩成功对象或 null
+        if (retryCompactionResult !== null) {
+          messages = retryCompactionResult.newMessages
+          parsed.historyBlobIds = retryCompactionResult.newBlobIds
+          currentSummaryArchiveIds = retryCompactionResult.newSummaryArchiveIds
+          usedTokensEstimate = retryCompactionResult.newUsedTokens
+          blobIds = []
+          execMessageIdCounter = 0
+          nextBlobbedMessageIndex = messages.length
+          lastCompactionBaseline = usedTokensEstimate
+          round-- // 重发本轮请求: for-loop 递增后回到同一 round
+          continue
+        }
+      }
 
       // 关键: 不再往对话流 yield textDelta('[BYOK Error] ...') —— 那会让错误文本
       // 伪装成 assistant 的"正常回复", 同时被写进 roundAssistantBlocks 污染历史,
@@ -1192,7 +1334,6 @@ export async function* handleConversationRun(
       // 后, composer.maybeThrowErrorAndRetry 会写入 ComposerData.submitErrorDetails,
       // Glass Composer 的 Lzv 组件渲染成 input 正上方的 retry banner。
       logger.error({ error: (e as Error).message, stack: (e as Error).stack }, '[LLM] stream error')
-      clearDraftCheckpoint(parsed.conversationId).catch(() => {})
       throw makeProviderError(e, {
         conversationId: parsed.conversationId,
         modelId: parsed.modelId,
@@ -1206,7 +1347,7 @@ export async function* handleConversationRun(
         lastAssistantContent = roundAssistantBlocks
         const turnBlobs = recordAssistantBlocksIntoTurn(activeTurn, roundAssistantBlocks)
         for (const blob of turnBlobs)
-          yield cacheAndBuildKvBlob(++blobCounter, blob)
+          run.blobs.cacheBlob(blob.blobId, blob.blobData, blob.blobDataRaw, blob.dependencies)
       }
       break
     }
@@ -1218,7 +1359,7 @@ export async function* handleConversationRun(
       lastAssistantContent = assistantContent
       const turnBlobs = recordAssistantBlocksIntoTurn(activeTurn, assistantContent)
       for (const blob of turnBlobs)
-        yield cacheAndBuildKvBlob(++blobCounter, blob)
+        run.blobs.cacheBlob(blob.blobId, blob.blobData, blob.blobDataRaw, blob.dependencies)
 
       const roundContext = route.createRoundContext()
       const roundImageBlocks: LLMContentBlock[] = []
@@ -1239,8 +1380,9 @@ export async function* handleConversationRun(
             currentModelId: parsed.modelId,
             subagentModelOverrides: parsed.subagentModelOverrides,
             round,
-            allocateExecMessageId: () => ++blobCounter,
+            allocateExecMessageId: () => ++execMessageIdCounter,
             cursorDynamicTools: parsed.cursorDynamicTools,
+            contextTokenLimit,
           })
           if (ctx)
             taskLaunches.push(ctx)
@@ -1265,8 +1407,8 @@ export async function* handleConversationRun(
           session,
           roundContext,
           messages,
-          allocateExecMessageId: () => ++blobCounter,
-          allocateInteractionId: () => interactionIdCounter++,
+          allocateExecMessageId: () => ++execMessageIdCounter,
+          allocateInteractionId: () => run.allocateInteractionId(),
           imageCollector: roundImageBlocks,
           readContext,
           // GetDynamicTools 需要据此决定取哪些 server、是否补 mcp_auth
@@ -1274,12 +1416,13 @@ export async function* handleConversationRun(
           supportsMcpAuth: parsed.supportsMcpAuth,
           cursorDynamicTools: parsed.cursorDynamicTools,
           projectDir: parsed.env.projectFolder ?? parsed.env.workspacePaths?.[0],
+          contextTokenLimit,
         })
         for await (const frame of toolFrames) {
           const completedToolCall = extractCompletedToolCall(frame)
           if (activeTurn && completedToolCall) {
             const toolBlob = activeTurn.addCompletedToolCall(completedToolCall)
-            yield cacheAndBuildKvBlob(++blobCounter, toolBlob)
+            run.blobs.cacheBlob(toolBlob.blobId, toolBlob.blobData, toolBlob.blobDataRaw, toolBlob.dependencies)
           }
           yield frame
         }
@@ -1296,7 +1439,7 @@ export async function* handleConversationRun(
           const completedToolCall = extractCompletedToolCall(frame)
           if (activeTurn && completedToolCall) {
             const toolBlob = activeTurn.addCompletedToolCall(completedToolCall)
-            yield cacheAndBuildKvBlob(++blobCounter, toolBlob)
+            run.blobs.cacheBlob(toolBlob.blobId, toolBlob.blobData, toolBlob.blobDataRaw, toolBlob.dependencies)
           }
           yield frame
         }
@@ -1338,26 +1481,27 @@ export async function* handleConversationRun(
         logger.info({ count: roundImageBlocks.length }, '[AGENT] injected image blocks from Read tool results')
       }
 
-      ({ nextIndex: nextBlobbedMessageIndex, blobCounter } = yield* flushMessageBlobs(
-        kvMessage,
+      ({ nextIndex: nextBlobbedMessageIndex } = retainMessageBlobs(
+        run.blobs,
         messages,
         nextBlobbedMessageIndex,
-        blobCounter,
         blobIds,
       ))
 
-      usedTokensEstimate = Math.max(usedTokensEstimate, estimateMessagesTokens(messages))
+      const charsLatch = estimateMessagesTokens(messages)
+      if (charsLatch > usedTokensEstimate)
+        estimateSource = 'chars/4'
+      usedTokensEstimate = Math.max(usedTokensEstimate, charsLatch)
 
       const allBlobIdsForCheckpoint = [...parsed.historyBlobIds, ...blobIds]
-      const materializedTurnBlob = activeTurn?.materializeTurnBlob()
-      if (materializedTurnBlob)
-        yield cacheAndBuildKvBlob(++blobCounter, materializedTurnBlob)
-      yield emitRollingCheckpoint({
+      const checkpointTurnBlobIds = retainCurrentTurnBlob()
+      yield* emitRollingCheckpoint({
+        run,
         conversationId: parsed.conversationId,
         round,
         nextBlobbedMessageIndex,
         allBlobIds: allBlobIdsForCheckpoint,
-        turnBlobIds: materializedTurnBlob ? [...turnBlobIds, materializedTurnBlob.blobId] : turnBlobIds,
+        turnBlobIds: checkpointTurnBlobIds,
         summaryArchiveIds: currentSummaryArchiveIds,
         usedTokensEstimate,
         contextTokenLimit,
@@ -1374,20 +1518,46 @@ export async function* handleConversationRun(
       // 链路①: 服务端 Agent Run 内自动 summarize
       // 每轮都检查——超阈值就触发 compaction,可重复触发,连续失败 3 次才熔断
       // (对齐 Claude Code autoCompactIfNeeded 的 consecutiveFailures 熔断机制)
-      if (autoCompactConsecutiveFailures < MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES
-        && shouldTriggerCompaction(usedTokensEstimate, contextTokenLimit)) {
+      //
+      // 两道防抖 (诊断报告 §8.1):
+      //   1. 净增长门槛: 距上次有效压缩基线的净增长 >= 15K 才允许再次触发,
+      //      打断"压缩后 provider usage 立刻反弹 -> 读一个文件就再压"的锯齿循环;
+      //   2. 硬安全线: 距窗口上限不足 8K 时无视门槛立即压缩,不为等门槛撑爆窗口。
+      const autoCompactThreshold = getAutoCompactThreshold(contextTokenLimit)
+      const overThreshold = autoCompactEnabled
+        && shouldTriggerCompaction(usedTokensEstimate, contextTokenLimit)
+      const netGrowthSinceCompaction = usedTokensEstimate - lastCompactionBaseline
+      const netGrowthOk = netGrowthSinceCompaction >= AUTOCOMPACT_NET_GROWTH_MIN_TOKENS
+      const hardPressure = usedTokensEstimate >= contextTokenLimit - Math.min(contextTokenLimit, 8192)
+      if (overThreshold && !netGrowthOk && !hardPressure) {
+        logger.info({
+          conversationId: parsed.conversationId,
+          round,
+          usedTokensEstimate,
+          threshold: autoCompactThreshold,
+          lastCompactionBaseline,
+          netGrowthSinceCompaction,
+          netGrowthMin: AUTOCOMPACT_NET_GROWTH_MIN_TOKENS,
+          estimateSource,
+        }, '[AGENT] auto-summarize: net-growth gate holds, skipping compaction')
+      } else if (overThreshold && autoCompactConsecutiveFailures < MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES) {
         logger.info({
           conversationId: parsed.conversationId,
           round,
           usedTokensEstimate,
           contextTokenLimit,
-          threshold: getAutoCompactThreshold(contextTokenLimit),
+          threshold: autoCompactThreshold,
+          maxOutputTokens: route.maxOutputTokens,
+          estimateSource,
+          hardPressure,
           consecutiveFailures: autoCompactConsecutiveFailures,
         }, '[AGENT] auto-summarize: threshold exceeded, triggering inline compaction')
 
         const compactionResult = yield* performInlineAutoSummarize({
+          run,
           parsed,
           allBlobIds: allBlobIdsForCheckpoint,
+          turnBlobIds: checkpointTurnBlobIds,
           summaryArchiveIds: currentSummaryArchiveIds,
           usedTokensEstimate,
           contextTokenLimit,
@@ -1396,7 +1566,14 @@ export async function* handleConversationRun(
           readPaths: [...readContext.readPaths],
         })
 
-        if (compactionResult) {
+        if (compactionResult === 'lock-held') {
+          // F5: 另一路压缩在飞行中 — 跳过本轮但不计失败 (熔断只留给真实压缩失败)
+          logger.info({
+            conversationId: parsed.conversationId,
+            round,
+            contentionCount: getCompactionContentionCount(parsed.conversationId),
+          }, '[AGENT] auto-summarize: concurrent compaction in flight — round skipped, failure fuse untouched')
+        } else if (compactionResult) {
           // 用 compacted 后的状态替换当前状态，继续后续 round
           messages = compactionResult.newMessages
           parsed.historyBlobIds = compactionResult.newBlobIds
@@ -1404,14 +1581,46 @@ export async function* handleConversationRun(
           usedTokensEstimate = compactionResult.newUsedTokens
           // 重置 blob 追踪：compaction 后 blobIds 都已合并到 parsed.historyBlobIds
           blobIds = []
-          blobCounter = 0
+          execMessageIdCounter = 0
           nextBlobbedMessageIndex = messages.length
-          autoCompactConsecutiveFailures = 0 // 成功后重置
+
+          // 首次压缩时间戳观测 (压缩间隔 p50/p95 的输入, 事故签名 4-5 分钟/次)
+          if (firstCompactionAt === 0) {
+            firstCompactionAt = Date.now()
+          }
+          else {
+            logger.info({
+              conversationId: parsed.conversationId,
+              sinceFirstCompactionMs: Date.now() - firstCompactionAt,
+            }, '[AUTOCOMPACT] compaction interval sample')
+          }
+          // 记录基准预算 (错误驱动重试的 budget/2^retry 被除数)
+          if (compactionResult.baseBudgetTokens > 0)
+            baseKeepTailBudget = compactionResult.baseBudgetTokens
+
+          // 压缩后仍超线 = 无效压缩 (keepTail 巨物压不动), 计入熔断而非清零,
+          // 否则"每轮都成功压缩却永远降不到线下"的循环没有任何刹车
+          if (usedTokensEstimate >= autoCompactThreshold) {
+            autoCompactConsecutiveFailures++
+            lastCompactionBaseline = usedTokensEstimate
+            logger.warn({
+              conversationId: parsed.conversationId,
+              newUsedTokens: usedTokensEstimate,
+              threshold: autoCompactThreshold,
+              consecutiveFailures: autoCompactConsecutiveFailures,
+            }, '[AGENT] auto-summarize: compaction ineffective (still above threshold), counting toward fuse')
+          } else {
+            autoCompactConsecutiveFailures = 0 // 有效压缩,成功后重置
+            lastCompactionBaseline = usedTokensEstimate
+          }
 
           logger.info({
             conversationId: parsed.conversationId,
             newMessageCount: messages.length,
             newUsedTokens: usedTokensEstimate,
+            threshold: autoCompactThreshold,
+            gapToThreshold: autoCompactThreshold - usedTokensEstimate,
+            lastCompactionBaseline,
           }, '[AGENT] auto-summarize: state replaced, continuing agent loop')
         } else {
           autoCompactConsecutiveFailures++
@@ -1424,6 +1633,8 @@ export async function* handleConversationRun(
       }
     }
     catch (e) {
+      if (run.signal.aborted && e instanceof Error && e.name === 'AbortError')
+        throw e
       if (isAgentRunAbortedError(e)) {
         logger.info({
           conversationId: parsed.conversationId,
@@ -1439,31 +1650,31 @@ export async function* handleConversationRun(
       // 半构造的 tool_use block, 我们让它和 error 一起丢弃, 保证客户端点 retry
       // 后从干净状态重发最后一条 human bubble。
       logger.error({ error: (e as Error).message, stack: (e as Error).stack }, '[AGENT] tool call processing error')
-      clearDraftCheckpoint(parsed.conversationId).catch(() => {})
+      if (isRunStateError(e))
+        throw e
       throw makeToolError(e)
     }
 
     logger.info({ round: round + 1, messages: messages.length, flushedToolResults }, '[AGENT] continuing LLM with tool results')
   }
 
-  ({ nextIndex: nextBlobbedMessageIndex, blobCounter } = yield* flushMessageBlobs(
-    kvMessage,
+  ({ nextIndex: nextBlobbedMessageIndex } = retainMessageBlobs(
+    run.blobs,
     messages,
     nextBlobbedMessageIndex,
-    blobCounter,
     blobIds,
   ))
 
-  usedTokensEstimate = Math.max(usedTokensEstimate, estimateMessagesTokens(messages))
+  const finalCharsLatch = estimateMessagesTokens(messages)
+  if (finalCharsLatch > usedTokensEstimate)
+    estimateSource = 'chars/4'
+  usedTokensEstimate = Math.max(usedTokensEstimate, finalCharsLatch)
 
-  const finalTurnBlob = activeTurn?.materializeTurnBlob()
-  if (finalTurnBlob)
-    yield cacheAndBuildKvBlob(++blobCounter, finalTurnBlob)
-
-  yield emitFinalCheckpoint({
+  yield* emitFinalCheckpoint({
+    run,
     conversationId: parsed.conversationId,
     allBlobIds: [...parsed.historyBlobIds, ...blobIds],
-    turnBlobIds: finalTurnBlob ? [...turnBlobIds, finalTurnBlob.blobId] : turnBlobIds,
+    turnBlobIds: retainCurrentTurnBlob(),
     summaryArchiveIds: currentSummaryArchiveIds,
     usedTokensEstimate,
     contextTokenLimit,
@@ -1477,9 +1688,7 @@ export async function* handleConversationRun(
     breakdownCategories,
   })
 
-  // SSE transport 在 response stream 结束后立即关闭底层 WritableIterable,
-  // 而客户端 ControlledKvManager 异步处理 setBlobArgs (setBlob + write setBlobResult)
-  // 可能还没完成, 导致 "WritableIterable already closed" 错误。
-  // 尾部 heartbeat 延长 stream 存活时间, 让客户端处理完最后一批 blob ACK。
+  // All staged blobs were acknowledged before the final checkpoint was published.
+  throwIfBlobRunInactive(run)
   yield heartbeat()
 }

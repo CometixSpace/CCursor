@@ -1,4 +1,4 @@
-import { str, arr } from '../shared';
+import { str } from '../shared';
 import type { ToolRegistryEntry } from '../types';
 
 /**

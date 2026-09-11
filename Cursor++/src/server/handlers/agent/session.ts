@@ -2,15 +2,50 @@
  * Agent Session 管理
  *
  * SSE 降级模式下，Client 通过两个独立通道通信:
- *   - BidiAppend (unary) — 发送 AgentClientMessage (data=base64 proto)
+ *   - BidiAppend (unary) — 发送 AgentClientMessage (hex data / dataBinary)
  *   - RunSSE (server_streaming) — 接收 AgentServerMessage 流
  *
  * 两者通过 requestId 关联。Session 维护一个 per-requestId 的消息队列，
  * BidiAppend 写入消息，RunSSE 消费消息并驱动 LLM 调用。
  */
 import { fromBinary, toJson } from '@bufbuild/protobuf';
-import { AgentClientMessageSchema } from '../../gen/agent_v1_pb';
+import { Code, ConnectError } from '@connectrpc/connect';
+import { createHash } from 'node:crypto';
+import { type AgentServerMessage, AgentClientMessageSchema } from '../../gen/agent_v1_pb';
 import { logger } from '../../logger';
+
+interface PendingAppend {
+    message: Record<string, unknown> | null;
+    digest: string;
+    byteLength: number;
+}
+
+interface AppendSequenceState {
+    nextSequence: bigint;
+    pending: Map<bigint, PendingAppend>;
+    pendingBytes: number;
+}
+
+interface SessionQueueCharges {
+    messages: WeakMap<Record<string, unknown>, number[]>;
+    queuedBytes: number;
+}
+
+// Local safeguards, not official protocol limits. The official sender allows
+// concurrent appends and retries, so arrival order is not input stream order.
+export const MAX_LIVE_SSE_SESSIONS = 32;
+export const MAX_TRANSPORT_QUEUED_BYTES = 64 * 1024 * 1024;
+export const MAX_SESSION_QUEUED_MESSAGES = 1024;
+export const MAX_PENDING_APPENDS = 1024;
+export const SESSION_RETENTION_MS = 30_000;
+
+let liveSseSessions = 0;
+let retainedTransportBytes = 0;
+
+/** Counted encoded payload, not JS heap or transport/library receive buffers. */
+export function getTransportResourceUsage(): { liveSseSessions: number; queuedBytes: number } {
+    return { liveSseSessions, queuedBytes: retainedTransportBytes };
+}
 
 /**
  * 后台 job 登记项。
@@ -41,15 +76,27 @@ export interface BackgroundJob {
 export interface AgentSession {
     requestId: string;
     messages: Array<Record<string, unknown>>;
-    /** @deprecated 保留向后兼容，新代码使用 listeners */
-    notify: (() => void) | null;
     listeners: Set<() => void>;
     closed: boolean;
+    /** The Run/RunSSE RPC signal, never the short-lived BidiAppend unary signal. */
+    transportSignal?: AbortSignal;
+    /** Allocating an id is not sending it. Only yielded Gets/Sets may be ACKed. */
+    expectedBlobReplies?: Map<number, 'getBlobResult' | 'setBlobResult'>;
+    transportError?: unknown;
+    appendSequence?: AppendSequenceState;
+    expirationTimer?: ReturnType<typeof setTimeout>;
+    queueCharges?: SessionQueueCharges;
+    /** Released once on cancel/close; tiny closed-ID tombstones do not count. */
+    holdsSseAdmission?: boolean;
     /**
      * 后台 job 注册表 (key = task_id 字符串形式: shell 用 shellId, subagent 用 agentId)。
      * 转后台时登记, AwaitShell 据此分流 readArgs / subagentAwaitArgs。
      */
     backgroundJobs: Map<string, BackgroundJob>;
+    /** KV ids remain monotonic when a transport session is reused by another run. */
+    nextBlobRequestId?: number;
+    /** Only correlation metadata, shared by runs using this transport session. */
+    activeBlobRequestIds?: Set<number>;
     /** env.terminalsFolder — 用于构造后台 shell 的终端文件路径 {terminalsFolder}/{shellId}.txt */
     terminalsFolder?: string;
     /**
@@ -71,10 +118,11 @@ export function createEphemeralSession(requestId: string): AgentSession {
     return {
         requestId,
         messages: [],
-        notify: null,
         listeners: new Set(),
         closed: false,
         backgroundJobs: new Map(),
+        nextBlobRequestId: 900_000,
+        activeBlobRequestIds: new Set(),
     };
 }
 
@@ -122,7 +170,23 @@ function extractCancelReason(json: Record<string, unknown>): string | undefined 
  * 随后 tryDispatchNextQueueItem 自动发出,消息不会丢。但它没有任何
  * waitForMessageMatching 的 predicate 会匹配,留在 messages 里只会无限堆积。
  */
-function ingestSessionMessage(session: AgentSession, json: Record<string, unknown>): void {
+function ingestSessionMessage(session: AgentSession, json: Record<string, unknown>, encodedByteLength?: number): void {
+    if (session.closed || session.cancelledReason !== undefined || 'clientHeartbeat' in json)
+        return;
+    const envelope = json.kvClientMessage as Record<string, unknown> | undefined;
+    const blobRequestId = envelope?.id;
+    if (envelope && typeof envelope === 'object' && ('getBlobResult' in envelope || 'setBlobResult' in envelope)
+        && typeof blobRequestId === 'number' && Number.isInteger(blobRequestId)
+        && blobRequestId >= 900_000 && blobRequestId < (session.nextBlobRequestId ?? 900_000)
+        && !session.activeBlobRequestIds?.has(blobRequestId)) {
+        // A completed request cannot become live again. Discard late bytes before
+        // queueing them, without inspecting or decoding their potentially large body.
+        return;
+    }
+    if ((session.transportSignal || session.appendSequence) && isUnsolicitedBlobReply(session, json))
+        return;
+    if (typeof blobRequestId === 'number' && envelope && ('getBlobResult' in envelope || 'setBlobResult' in envelope))
+        session.expectedBlobReplies?.delete(blobRequestId);
     if (isContextInjection(json)) {
         logger.debug({ requestId: session.requestId }, '[SESSION] dropping context injection (run-time injection unsupported)');
         return;
@@ -134,8 +198,21 @@ function ingestSessionMessage(session: AgentSession, json: Record<string, unknow
             session.cancelledReason = cancelReason;
             logger.info({ requestId: session.requestId, reason: cancelReason }, '[CANCEL] client cancelled the run');
         }
+        releaseSessionPayloads(session);
+        releaseSseAdmission(session);
     }
     else {
+        if (session.messages.length >= MAX_SESSION_QUEUED_MESSAGES)
+            rejectSessionResource(session, 'Agent session ordinary message queue exceeded its limit');
+        // Production transports supply protobuf byte length. Direct in-process
+        // callers may use non-proto JSON; count its serialized UTF-8 payload.
+        const byteLength = encodedByteLength ?? Buffer.byteLength(JSON.stringify(json), 'utf8');
+        chargeTransportBytes(session, byteLength);
+        const charges = session.queueCharges ??= { messages: new WeakMap(), queuedBytes: 0 };
+        const messageCharges = charges.messages.get(json) ?? [];
+        messageCharges.push(byteLength);
+        charges.messages.set(json, messageCharges);
+        charges.queuedBytes += byteLength;
         session.messages.push(json);
     }
     notifyAll(session);
@@ -158,56 +235,234 @@ export function getBackgroundJob(session: AgentSession, taskId: string): Backgro
 }
 
 function notifyAll(session: AgentSession): void {
-    session.notify?.();
     for (const fn of session.listeners) fn();
 }
 
-export function pushSessionMessage(session: AgentSession, json: Record<string, unknown>): void {
-    ingestSessionMessage(session, json);
+export function pushSessionMessage(session: AgentSession, json: Record<string, unknown>, encodedByteLength?: number): void {
+    ingestSessionMessage(session, json, encodedByteLength);
+}
+
+function rejectSession(session: AgentSession, error: ConnectError): never {
+    session.transportError = error;
+    markSessionClosed(session);
+    throw error;
+}
+
+function rejectSessionResource(session: AgentSession, detail: string): never {
+    return rejectSession(session, new ConnectError(detail, Code.ResourceExhausted));
+}
+
+function chargeTransportBytes(session: AgentSession, byteLength: number): void {
+    if (!Number.isSafeInteger(byteLength) || byteLength < 0)
+        rejectSessionResource(session, 'Agent transport received an invalid encoded payload size');
+    if (byteLength > MAX_TRANSPORT_QUEUED_BYTES - retainedTransportBytes)
+        rejectSessionResource(session, 'Agent transport process queued payload budget exceeded');
+    retainedTransportBytes += byteLength;
+}
+
+function releaseMessageCharge(session: AgentSession, message: Record<string, unknown>): void {
+    const charges = session.queueCharges;
+    const messageCharges = charges?.messages.get(message);
+    const byteLength = messageCharges?.shift();
+    // Tests and legacy in-process callers can insert uncharged messages directly.
+    if (byteLength === undefined || !charges)
+        return;
+    charges.queuedBytes -= byteLength;
+    retainedTransportBytes -= byteLength;
+    if (messageCharges?.length === 0)
+        charges.messages.delete(message);
+}
+
+/** Discard matching ordinary messages in FIFO order, releasing only our charges. */
+export function discardSessionMessages(session: AgentSession, predicate: (message: Record<string, unknown>) => boolean): void {
+    session.messages = session.messages.filter(message => {
+        if (!predicate(message))
+            return true;
+        releaseMessageCharge(session, message);
+        return false;
+    });
+}
+
+function takeSessionMessage(session: AgentSession, index: number): Record<string, unknown> {
+    const message = session.messages.splice(index, 1)[0]!;
+    releaseMessageCharge(session, message);
+    return message;
+}
+
+function releaseSessionPayloads(session: AgentSession): void {
+    // Release aggregate charges even if a direct caller replaced the array.
+    retainedTransportBytes -= session.queueCharges?.queuedBytes ?? 0;
+    session.queueCharges = undefined;
+    session.messages.length = 0;
+    session.expectedBlobReplies?.clear();
+    if (session.appendSequence) {
+        retainedTransportBytes -= session.appendSequence.pendingBytes;
+        session.appendSequence.pending.clear();
+        session.appendSequence.pendingBytes = 0;
+    }
+}
+
+function releaseSseAdmission(session: AgentSession): void {
+    if (session.holdsSseAdmission) {
+        session.holdsSseAdmission = false;
+        liveSseSessions--;
+    }
 }
 
 export function markSessionClosed(session: AgentSession): void {
     session.closed = true;
+    releaseSessionPayloads(session);
+    releaseSseAdmission(session);
+    session.backgroundJobs.clear();
     notifyAll(session);
 }
 
 const sessions = new Map<string, AgentSession>();
 
+/** Forward disconnect/deadline to every run-owned waiter via session listeners. */
+export function attachSessionTransport(session: AgentSession, signal: AbortSignal): () => void {
+    if (session.transportError)
+        throw session.transportError;
+    if (session.closed)
+        throw new ConnectError('Agent transport session is closed; use a new request ID', Code.FailedPrecondition);
+    if (session.transportSignal)
+        throw new ConnectError('Agent transport request ID already has a RunSSE consumer', Code.AlreadyExists);
+    session.transportSignal = signal;
+    session.expectedBlobReplies = new Map();
+    if (session.expirationTimer) {
+        clearTimeout(session.expirationTimer);
+        session.expirationTimer = undefined;
+    }
+    const onAbort = (): void => markSessionClosed(session);
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted)
+        onAbort();
+    return () => signal.removeEventListener('abort', onAbort);
+}
+
+/** Called at the registered output boundary, immediately before yielding. */
+export function recordSessionBlobRequestSent(session: AgentSession, frame: AgentServerMessage): void {
+    if (frame.message.case !== 'kvServerMessage')
+        return;
+    const envelope = frame.message.value;
+    const requestKind = envelope.message.case;
+    if (requestKind !== 'getBlobArgs' && requestKind !== 'setBlobArgs')
+        return;
+    const expectedReplies = session.expectedBlobReplies;
+    if (!expectedReplies)
+        return;
+    for (const requestId of expectedReplies.keys()) {
+        if (!session.activeBlobRequestIds?.has(requestId))
+            expectedReplies.delete(requestId);
+    }
+    expectedReplies.set(envelope.id, requestKind === 'getBlobArgs' ? 'getBlobResult' : 'setBlobResult');
+}
+
+function expireSessionLater(session: AgentSession): void {
+    if (session.expirationTimer)
+        clearTimeout(session.expirationTimer);
+    session.expirationTimer = setTimeout(() => {
+        markSessionClosed(session);
+        if (sessions.get(session.requestId) === session)
+            sessions.delete(session.requestId);
+    }, SESSION_RETENTION_MS);
+    session.expirationTimer.unref?.();
+}
+
 export function getOrCreateSession(requestId: string): AgentSession {
     let session = sessions.get(requestId);
     if (!session) {
+        if (liveSseSessions >= MAX_LIVE_SSE_SESSIONS)
+            throw new ConnectError('Agent transport live SSE session limit exceeded', Code.ResourceExhausted);
         // 复用 createEphemeralSession —— 两处各自写字面量时,新增字段容易只补一处
         session = createEphemeralSession(requestId);
+        session.holdsSseAdmission = true;
+        liveSseSessions++;
         sessions.set(requestId, session);
+        // BidiAppend may precede RunSSE. Unclaimed input cannot live forever.
+        expireSessionLater(session);
         logger.debug({ requestId }, '[SESSION] created');
     }
     return session;
 }
 
-/** BidiAppend 调用时，将消息推入 session 队列 */
-export function appendMessage(requestId: string, data: string): void {
-    const session = getOrCreateSession(requestId);
-
-    // data 是 proto string 类型，实际承载的是 protobuf binary 的 hex 字符串表示。
-    // "0ad88200a00012..." → hex decode → protobuf bytes
-    try {
-        const bytes = Buffer.from(data, 'hex');
-        const clientMsg = fromBinary(AgentClientMessageSchema, bytes);
-        const json = toJson(AgentClientMessageSchema, clientMsg) as Record<string, unknown>;
-        const keys = Object.keys(json);
-        logger.info({ requestId, keys, protoBytes: bytes.length }, '[SESSION] appendMessage');
-        ingestSessionMessage(session, json);
-    } catch (e) {
-        logger.warn({ requestId, dataLen: data.length, error: (e as Error).message }, '[SESSION] proto decode failed');
-    }
+function isUnsolicitedBlobReply(session: AgentSession, json: Record<string, unknown>): boolean {
+    const envelope = json.kvClientMessage as Record<string, unknown> | undefined;
+    if (!envelope || !('getBlobResult' in envelope || 'setBlobResult' in envelope))
+        return false;
+    if (typeof envelope.id !== 'number' || !session.activeBlobRequestIds?.has(envelope.id))
+        return true;
+    const expectedKind = session.expectedBlobReplies?.get(envelope.id);
+    return !expectedKind || !(expectedKind in envelope);
 }
 
-/** 等待下一条消息（任意类型） */
-export async function waitForMessage(
-    session: AgentSession,
-    timeoutMs: number | null = 30_000,
-): Promise<Record<string, unknown> | null> {
-    return waitForMessageMatching(session, () => true, timeoutMs);
+/** Decode both official encodings, then release only contiguous append seqnos. */
+export function appendMessage(requestId: string, data: string, appendSeqno: bigint, dataBinary: Uint8Array): void {
+    if (appendSeqno < 0n)
+        throw new ConnectError('BidiAppend append_seqno must be non-negative', Code.InvalidArgument);
+    if (data && (data.length % 2 !== 0 || !/^[\da-f]+$/i.test(data)))
+        throw new ConnectError('BidiAppend data must be a hexadecimal protobuf payload', Code.InvalidArgument);
+    const hexBytes = data ? Buffer.from(data, 'hex') : undefined;
+    if (hexBytes && dataBinary.length && !hexBytes.equals(dataBinary))
+        throw new ConnectError('BidiAppend data and data_binary disagree', Code.InvalidArgument);
+    const bytes = dataBinary.length ? dataBinary : hexBytes;
+    if (!bytes?.length)
+        throw new ConnectError('BidiAppend requires data or data_binary', Code.InvalidArgument);
+
+    const session = getOrCreateSession(requestId);
+    if (session.closed || session.cancelledReason !== undefined)
+        throw new ConnectError('BidiAppend session is closed; use a new request ID', Code.FailedPrecondition);
+    const sequence = session.appendSequence ??= { nextSequence: 0n, pending: new Map(), pendingBytes: 0 };
+    // 3.14.27 agent-host: l=0; seqno=l++; at most 32 in-flight sends;
+    // retry attempts reuse the original seqno and identical protobuf bytes.
+    if (appendSeqno < sequence.nextSequence)
+        return;
+    const digest = createHash('sha256').update(bytes).digest('hex');
+    const pending = sequence.pending.get(appendSeqno);
+    if (pending) {
+        if (pending.digest !== digest)
+            rejectSession(session, new ConnectError('BidiAppend reused a pending seqno with different data', Code.InvalidArgument));
+        return;
+    }
+
+    let json: Record<string, unknown>;
+    try {
+        const clientMsg = fromBinary(AgentClientMessageSchema, bytes);
+        json = toJson(AgentClientMessageSchema, clientMsg) as Record<string, unknown>;
+    } catch (error) {
+        rejectSession(session, new ConnectError('BidiAppend contains invalid AgentClientMessage protobuf', Code.InvalidArgument, undefined, undefined, error));
+    }
+    // Decide at arrival, NOT after reordering: an early/stale ACK cannot become
+    // valid merely because its target id gets allocated while an earlier seqno
+    // is missing. Keep a sequence placeholder, not the unsolicited blob bytes.
+    const message = 'clientHeartbeat' in json || isUnsolicitedBlobReply(session, json) ? null : json;
+    const byteLength = message ? bytes.byteLength : 0;
+    if (appendSeqno === sequence.nextSequence) {
+        // Gap-filling input need not occupy another reorder slot. In-order
+        // cancellation can release a full budget without first charging itself.
+        sequence.nextSequence++;
+        if (message)
+            ingestSessionMessage(session, message, byteLength);
+    }
+    else {
+        if (sequence.pending.size >= MAX_PENDING_APPENDS)
+            rejectSessionResource(session, 'BidiAppend pending sequence buffer exceeded its limit');
+        chargeTransportBytes(session, byteLength);
+        sequence.pending.set(appendSeqno, { message, digest, byteLength });
+        sequence.pendingBytes += byteLength;
+    }
+    while (!session.closed) {
+        const nextAppend = sequence.pending.get(sequence.nextSequence);
+        if (!nextAppend)
+            break;
+        sequence.pending.delete(sequence.nextSequence++);
+        sequence.pendingBytes -= nextAppend.byteLength;
+        // Transfer ownership synchronously: a discarded/control frame releases
+        // its charge; ordinary ingestion takes the same bytes without doubling.
+        retainedTransportBytes -= nextAppend.byteLength;
+        if (nextAppend.message)
+            ingestSessionMessage(session, nextAppend.message, nextAppend.byteLength);
+    }
 }
 
 /**
@@ -221,11 +476,13 @@ export async function waitForMessageMatching(
     session: AgentSession,
     predicate: (msg: Record<string, unknown>) => boolean,
     timeoutMs: number | null = 30_000,
+    signal?: AbortSignal,
 ): Promise<Record<string, unknown> | null> {
+    if (signal?.aborted) return null;
     // 先检查队列中是否已有匹配消息
     const idx = session.messages.findIndex(predicate);
     if (idx >= 0) {
-        return session.messages.splice(idx, 1)[0];
+        return takeSessionMessage(session, idx);
     }
     // cancelled 与 closed 同样立即结束等待 —— 调用方 (wait.ts) 据
     // session.cancelledReason 区分二者,把前者转成 AgentRunAbortedError
@@ -233,21 +490,14 @@ export async function waitForMessageMatching(
 
     return new Promise<Record<string, unknown> | null>((resolve) => {
         let resolved = false;
+        let timer: ReturnType<typeof setTimeout> | null = null;
 
-        const cleanup = () => {
-            resolved = true;
-            if (timer != null)
-                clearTimeout(timer);
-            session.listeners.delete(listener);
-        };
-
-        const timer = timeoutMs == null ? null : setTimeout(() => {
+        const abortListener = () => {
             if (resolved)
                 return;
             cleanup();
-            logger.warn({ requestId: session.requestId, timeoutMs }, '[SESSION] waitForMessage timeout');
             resolve(null);
-        }, timeoutMs);
+        };
 
         const listener = () => {
             if (resolved)
@@ -255,7 +505,7 @@ export async function waitForMessageMatching(
             const i = session.messages.findIndex(predicate);
             if (i >= 0) {
                 cleanup();
-                resolve(session.messages.splice(i, 1)[0]);
+                resolve(takeSessionMessage(session, i));
                 return;
             }
             if (session.closed || session.cancelledReason !== undefined) {
@@ -264,7 +514,27 @@ export async function waitForMessageMatching(
             }
         };
 
+        function cleanup(): void {
+            resolved = true;
+            if (timer != null)
+                clearTimeout(timer);
+            session.listeners.delete(listener);
+            signal?.removeEventListener('abort', abortListener);
+        }
+
         session.listeners.add(listener);
+        signal?.addEventListener('abort', abortListener, { once: true });
+        if (signal?.aborted) {
+            abortListener();
+            return;
+        }
+        timer = timeoutMs == null ? null : setTimeout(() => {
+            if (resolved)
+                return;
+            cleanup();
+            logger.warn({ requestId: session.requestId, timeoutMs }, '[SESSION] waitForMessage timeout');
+            resolve(null);
+        }, timeoutMs);
     });
 }
 
@@ -290,9 +560,10 @@ export async function waitForInteractionResponse(
 export function closeSession(requestId: string): void {
     const session = sessions.get(requestId);
     if (session) {
-        session.closed = true;
-        notifyAll(session);
-        sessions.delete(requestId);
+        markSessionClosed(session);
+        // A short closed-session tombstone rejects in-flight append retries.
+        // Retain no queued payloads while the recent transport ID stays closed.
+        expireSessionLater(session);
         logger.debug({ requestId }, '[SESSION] closed');
     }
 }

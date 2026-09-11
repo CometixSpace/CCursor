@@ -45,6 +45,10 @@
       {
         "command": "cursor2plus.openLogFile",
         "title": "Cursor++: Open Log File"
+      },
+      {
+        "command": "cursor2plus.openUsageDashboard",
+        "title": "Cursor++: Open Usage Dashboard"
       }
     ],
     "configuration": {
@@ -132,6 +136,7 @@
     "@types/ws": "^8.18.0",
     "@vscode/vsce": "^3.9.1",
     "alpinejs": "^3.15.12",
+    "chart.js": "^4.5.1",
     "esbuild": "^0.28.0",
     "eslint": "^10.4.0",
     "npm-run-all": "^4.1.5",

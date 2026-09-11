@@ -114,7 +114,9 @@ export default (router: ConnectRouter) => {
                 appJsGzip: req.appJs,
                 dataJson: req.dataJson,
             })
-            const safeName = (req.title || 'canvas').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim() || 'canvas'
+            const safeName = Array.from(req.title || 'canvas', character =>
+                /[<>:"/\\|?*]/.test(character) || character.charCodeAt(0) < 32 ? '_' : character,
+            ).join('').trim() || 'canvas'
             const exportPath = join(getCanvasesDir(), `${safeName}.html`)
             writeFileSync(exportPath, html)
             return { shareId: result.shareId, shareUrl: `file://${exportPath}` }

@@ -2,6 +2,8 @@ import type { IdeFile, ParsedCursorRule, ParsedRunRequest } from './types'
 import { listKnowledgeItems } from '../../../config/knowledgeBaseStore'
 import { logger } from '../../../logger'
 import { emptyParsed, toBytes } from './shared'
+import { blobIdFromBytes } from '../blob'
+import { BlobIntegrityError } from '../blobErrors'
 import {
   categorizeCursorRules,
   isSkillPath,
@@ -19,6 +21,19 @@ type ParsedBackgroundTaskCompletion = {
   detail?: string
   outputPath?: string
   threadId?: string
+}
+
+function parseBlobReferences(value: unknown): string[] {
+  if (value === undefined || value === null)
+    return []
+  if (!Array.isArray(value))
+    throw new BlobIntegrityError([{ blobId: '(reference list)', status: 'invalid-reference' }])
+  return value.map((reference) => {
+    const bytes = toBytes(reference)
+    if (!bytes?.byteLength)
+      throw new BlobIntegrityError([{ blobId: '(empty reference)', status: 'invalid-reference' }])
+    return blobIdFromBytes(bytes)
+  })
 }
 
 function normalizeBackgroundTaskKind(value: unknown): string {
@@ -102,7 +117,7 @@ export function parseRunRequest(msg: Record<string, unknown>): ParsedRunRequest 
   const backgroundTaskCompletions = parseBackgroundTaskCompletions(action)
   const isBackgroundTaskCompletion = backgroundTaskCompletions.length > 0
   // 子代理判定: subagentTypeName 由客户端在创建 subagent RunSSE 时设置
-  // conversationGroupId 在 toJson() 后被 proto 丢弃 (非 schema field)
+  // conversationGroupId is root-parent correlation, not this child's state identity.
   const subagentTypeName = runRequest.subagentTypeName as string | undefined
   const isSubagent = typeof subagentTypeName === 'string' && subagentTypeName.length > 0
 
@@ -222,11 +237,8 @@ export function parseRunRequest(msg: Record<string, unknown>): ParsedRunRequest 
   //
   // 两种常见形态:
   //  1. rpmLen > 0: 客户端在 checkpoint roundtrip 里带回了历史, server 直接采用
-  //  2. csKeys=[]:  客户端发空 → 新会话或 revert 后重置信号,
-  //                  后续 agentOrchestrator 会检测 sqlite checkpoint 是否存在:
-  //                    - 存在 → 清空 (revert 信号)
-  //                    - 不存在 → 首次新会话, 维持空状态重建
-  //  详见 analysis/checkpoint-revert-protocol.md
+  //  2. csKeys=[]: new conversation, reset, or delayed initial request.
+  // No client epoch is transmitted; never infer deletion or recover SQL history.
   const csKeys = conversationState ? Object.keys(conversationState) : []
   const rpmLen = (conversationState?.rootPromptMessagesJson as unknown[])?.length ?? 0
   const csMode = conversationState?.mode as string | undefined
@@ -238,7 +250,7 @@ export function parseRunRequest(msg: Record<string, unknown>): ParsedRunRequest 
     csEmpty: csKeys.length === 0,
   }, rpmLen > 0
     ? '[SESSION] <<< CS RECV: client sent history (checkpoint roundtrip OK)'
-    : '[SESSION] <<< CS RECV: empty (new session or revert; sqlite will be cleared if stale)',
+    : '[SESSION] <<< CS RECV: empty (new session or unverified reset; no automatic history restore/delete)',
   )
 
   // 提取用户消息附带的图片
@@ -683,9 +695,9 @@ export function parseRunRequest(msg: Record<string, unknown>): ParsedRunRequest 
     if (e.blobId) {
       const raw = e.blobId
       const blobId = raw instanceof Uint8Array
-        ? Buffer.from(raw).toString('utf-8')
+        ? blobIdFromBytes(raw)
         : typeof raw === 'string'
-          ? (() => { try { return Buffer.from(raw, 'base64').toString('utf-8') } catch { return raw } })()
+          ? blobIdFromBytes(Buffer.from(raw, 'base64'))
           : ''
       return { blobId }
     }
@@ -696,7 +708,7 @@ export function parseRunRequest(msg: Record<string, unknown>): ParsedRunRequest 
     }
     if (dob?.case === 'blobId' && dob.value) {
       const blobId = dob.value instanceof Uint8Array
-        ? Buffer.from(dob.value).toString('utf-8')
+        ? blobIdFromBytes(dob.value)
         : String(dob.value)
       return { blobId }
     }
@@ -755,6 +767,8 @@ export function parseRunRequest(msg: Record<string, unknown>): ParsedRunRequest 
         : baseUserText,
     modelId: (requestedModel?.modelId as string) || (modelDetails?.modelId as string) || '',
     conversationId: (runRequest.conversationId as string) ?? '',
+    runId: typeof runRequest.runId === 'string' && runRequest.runId ? runRequest.runId : undefined,
+    conversationGroupId: typeof runRequest.conversationGroupId === 'string' && runRequest.conversationGroupId ? runRequest.conversationGroupId : undefined,
     requestContextTransport: requestContextParts
       ? (inlineRequestContext ? 'dual' : 'ref_only')
       : 'legacy',
@@ -872,72 +886,9 @@ export function parseRunRequest(msg: Record<string, unknown>): ParsedRunRequest 
     // ConversationState (runRequest) 中是 string[] (T:9)。
     // protobuf-es 将 bytes → string 时做了 base64 encode,
     // 所以收到的 string 需要 base64 decode 还原为原始 blobId。
-    historyBlobIds: (() => {
-      const raw = conversationState?.rootPromptMessagesJson
-      if (!raw || !Array.isArray(raw))
-        return []
-      const ids = raw.map((v: unknown) => {
-        if (typeof v !== 'string')
-          return String(v)
-        // base64 decode: Server 存入 TextEncoder.encode(blobId) → bytes,
-        // Client 回传时 protobuf-es 对 bytes 做 base64 → 这里 decode 还原
-        try {
-          return Buffer.from(v, 'base64').toString('utf-8')
-        }
-        catch {
-          return v
-        }
-      })
-      if (ids.length > 0) {
-        logger.debug({ first: ids[0], count: ids.length }, '[SESSION] historyBlobIds extracted')
-      }
-      return ids
-    })(),
-    historyTurnBlobIds: (() => {
-      const raw = conversationState?.turns
-      if (!raw || !Array.isArray(raw))
-        return []
-      return raw.map((v: unknown) => {
-        if (typeof v !== 'string')
-          return String(v)
-        try {
-          return Buffer.from(v, 'base64').toString('utf-8')
-        }
-        catch {
-          return v
-        }
-      })
-    })(),
-    historyTurns: (() => {
-      const raw = conversationState?.turns
-      if (!raw || !Array.isArray(raw))
-        return []
-      return raw.map((v: unknown) => {
-        if (typeof v !== 'string')
-          return String(v)
-        try {
-          return Buffer.from(v, 'base64').toString('utf-8')
-        }
-        catch {
-          return v
-        }
-      })
-    })(),
-    historySummaryArchiveIds: (() => {
-      const raw = conversationState?.summaryArchives
-      if (!raw || !Array.isArray(raw))
-        return []
-      return raw.map((v: unknown) => {
-        if (typeof v !== 'string')
-          return String(v)
-        try {
-          return Buffer.from(v, 'base64').toString('utf-8')
-        }
-        catch {
-          return v
-        }
-      })
-    })(),
+    historyBlobIds: parseBlobReferences(conversationState?.rootPromptMessagesJson),
+    historyTurnBlobIds: parseBlobReferences(conversationState?.turns),
+    historySummaryArchiveIds: parseBlobReferences(conversationState?.summaryArchives),
     historyTokenDetails: (() => {
       const tokenDetails = conversationState?.tokenDetails as Record<string, unknown> | undefined
       if (!tokenDetails)

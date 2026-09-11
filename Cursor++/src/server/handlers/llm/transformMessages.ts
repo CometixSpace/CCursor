@@ -151,7 +151,7 @@ function stringifyContent(content: LLMMessage['content']): string {
   if (typeof content === 'string')
     return content
   return content
-    .map((block) => {
+    .map((block): string => {
       switch (block.type) {
         case 'text':
         case 'thinking':
@@ -162,6 +162,10 @@ function stringifyContent(content: LLMMessage['content']): string {
           return `[tool call] ${block.name} ${JSON.stringify(block.input)}`
         case 'image':
           return `[image:${block.mimeType}]`
+        default: {
+          const unhandledBlock: never = block
+          throw new TypeError(`Unsupported LLM content block: ${JSON.stringify(unhandledBlock)}`)
+        }
       }
     })
     .filter(Boolean)
@@ -428,7 +432,11 @@ function sanitizeUnsupportedHistoricalTools(
       sanitizedContent.push(block)
     }
 
-    result.push({ ...msg, content: sanitizedContent })
+    // 降级产生的是 text 块: Anthropic 契约要求 tool_use 之后不得再有非 tool_use 块,
+    // 因此把非 tool_use 块统一提到首个 tool_use 之前 (与 splitAssistantToolUseMessage 的拆分语义一致)。
+    const nonToolUseBlocks = sanitizedContent.filter(block => block.type !== 'tool_use')
+    const toolUseBlocks = sanitizedContent.filter(block => block.type === 'tool_use')
+    result.push({ ...msg, content: [...nonToolUseBlocks, ...toolUseBlocks] })
 
     if (unsupportedIds.size === 0)
       continue

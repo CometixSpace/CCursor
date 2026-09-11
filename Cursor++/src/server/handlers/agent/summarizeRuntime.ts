@@ -2,28 +2,54 @@ import { randomUUID } from 'crypto';
 import type { AgentServerMessage } from '../../gen/agent_v1_pb';
 import { workspaceUris, type ParsedRunRequest } from './protocol';
 import type { AgentSession } from './session';
-import { heartbeat, checkpoint, kvMessage, summary, summaryCompleted, summaryStarted } from './stream';
+import { heartbeat, checkpoint, summaryCompleted, summaryStarted } from './stream';
 import { clampTokenDetails, computeContextUsagePercent } from './usage';
 import { resolveProviderRuntime } from '../llm';
-import { hydrateHistoryEntries, repairHistoryEntries } from './historyManager';
-import { createCompactionArtifacts, estimateMessagesTokens, formatMessageForSummary, planCompaction } from './compactionStrategy';
+import type { BlobRunContext } from './runContext';
+import { loadHistoryEntries, repairHistoryEntries } from './historyManager';
+import { measureMessagesTokens, planCompaction } from './compactionStrategy';
+import { releaseCompactionLock, tryAcquireCompactionLock } from './compactionLock';
+import { executeCompaction, waitForRunCompactionLockRelease } from './compactionExecution';
 import { executePreCompactHook } from './hookRuntime';
-import { persistConversationCheckpoint } from '../../database/checkpoints';
-import { SUMMARY_SYSTEM_PROMPT, buildSummaryUserMessage } from './summaryPrompt';
 import { logger } from '../../logger';
+import { saveRunCheckpoint, throwIfBlobRunInactive } from './checkpointManager';
 
 export async function* handleSummarizeAction(
     parsed: ParsedRunRequest,
     session: AgentSession | null,
+    run: BlobRunContext,
 ): AsyncIterable<AgentServerMessage> {
+    throwIfBlobRunInactive(run);
     const route = resolveProviderRuntime(parsed.modelId);
-    const hydratedHistoryEntries = hydrateHistoryEntries(parsed.historyBlobIds);
-    const missingHistoryBlobs = Math.max(0, parsed.historyBlobIds.length - hydratedHistoryEntries.length);
-    const historyEntries = repairHistoryEntries(hydratedHistoryEntries);
-    const compactionPlan = planCompaction(historyEntries);
+    // Release wakes every waiter; only a successful acquire grants lock ownership.
+    while (!tryAcquireCompactionLock(parsed.conversationId))
+        yield* waitForRunCompactionLockRelease(parsed.conversationId, run);
+    try {
+        throwIfBlobRunInactive(run);
+        yield* handleSummarizeActionLocked(parsed, session, route, run);
+    }
+    finally {
+        releaseCompactionLock(parsed.conversationId);
+    }
+}
+
+async function* handleSummarizeActionLocked(
+    parsed: ParsedRunRequest,
+    session: AgentSession | null,
+    route: ReturnType<typeof resolveProviderRuntime>,
+    run: BlobRunContext,
+): AsyncIterable<AgentServerMessage> {
+    // 历史 blob 与对话路径同源: 内存未命中的经 getBlobArgs 向客户端取
+    const hydratedHistoryEntries = yield* loadHistoryEntries({
+        historyBlobIds: parsed.historyBlobIds,
+        run,
+    });
+    const historyEntries = repairHistoryEntries(hydratedHistoryEntries, run.blobs);
+    const contextTokenLimit = parsed.historyTokenDetails?.maxTokens ?? parsed.contextTokenLimit ?? route.contextTokenLimit;
+    const compactionPlan = planCompaction(historyEntries, { contextTokenLimit });
     const currentTokenDetails = clampTokenDetails(
-        parsed.historyTokenDetails?.usedTokens ?? estimateMessagesTokens(historyEntries.map(entry => entry.message)),
-        parsed.historyTokenDetails?.maxTokens ?? parsed.contextTokenLimit ?? route.contextTokenLimit,
+        parsed.historyTokenDetails?.usedTokens ?? measureMessagesTokens(historyEntries.map(entry => entry.message)),
+        contextTokenLimit,
     );
     const contextUsagePercent = computeContextUsagePercent(currentTokenDetails.usedTokens, currentTokenDetails.maxTokens);
     const generationId = randomUUID();
@@ -33,7 +59,6 @@ export async function* handleSummarizeAction(
         model: route.model,
         historyBlobIds: parsed.historyBlobIds.length,
         hydratedEntries: hydratedHistoryEntries.length,
-        missingBlobs: missingHistoryBlobs,
         summarizeEntries: compactionPlan.summarizeEntries.length,
         keepTail: compactionPlan.keepTail.length,
         contextUsagePercent: contextUsagePercent.toFixed(1),
@@ -57,48 +82,30 @@ export async function* handleSummarizeAction(
         execMessageId: 1,
     });
 
+    throwIfBlobRunInactive(run);
     yield summaryStarted();
-
-    if (missingHistoryBlobs > 0) {
-        logger.warn({
-            conversationId: parsed.conversationId,
-            requestedBlobs: parsed.historyBlobIds.length,
-            resolvedBlobs: hydratedHistoryEntries.length,
-            missingHistoryBlobs,
-        }, '[AGENT] summarizeAction skipped due to incomplete history');
-
-        persistConversationCheckpoint({
-            kind: 'committed',
-            conversationId: parsed.conversationId,
-            rootBlobIds: parsed.historyBlobIds,
-            turnBlobIds: parsed.historyTurnBlobIds,
-            summaryArchiveIds: parsed.historySummaryArchiveIds,
-            tokenDetails: currentTokenDetails,
-            mode: parsed.mode,
-            updatedAt: Date.now(),
-        });
-
-        yield checkpoint(
-            parsed.historyBlobIds,
-            currentTokenDetails.usedTokens,
-            currentTokenDetails.maxTokens,
-            parsed.mode,
-            undefined,
-            {
-                turnBlobIds: parsed.historyTurnBlobIds,
-                summaryArchiveIds: parsed.historySummaryArchiveIds,
-                workspaceUris: workspaceUris(parsed),
-                readPaths: parsed.readPaths,
-                modelName: route.model,
-                gitRepos: parsed.gitRepos?.map(r => ({ path: r.path, branchName: r.branchName })),
-            },
-        );
-        yield summaryCompleted(hookMessage ?? 'Compaction deferred: conversation history is incomplete.');
-        return;
-    }
+    throwIfBlobRunInactive(run);
 
     if (compactionPlan.summarizeEntries.length === 0) {
-        persistConversationCheckpoint({
+        // F2: mode==='disabled' 时 plan 同样返回空 summarizeEntries, 但语义是
+        // "压缩结构性不可行" (leading 过大/窗口过小), 不是"已经够紧凑" — 文案须区分
+        if (compactionPlan.mode === 'disabled') {
+            logger.warn({
+                conversationId: parsed.conversationId,
+                contextTokenLimit,
+                leadingTokens: compactionPlan.diagnostics.leadingTokens,
+            }, '[AUTOCOMPACT] summarizeAction skipped — compaction structurally infeasible for this window');
+        }
+        logger.info({
+            conversationId: parsed.conversationId,
+            origin: 'client_summarize',
+            kind: 'committed',
+            usedTokens: currentTokenDetails.usedTokens,
+            maxTokens: currentTokenDetails.maxTokens,
+            rootBlobCount: parsed.historyBlobIds.length,
+            summaryArchiveCount: parsed.historySummaryArchiveIds.length,
+        }, '[AUTOCOMPACT] checkpoint write');
+        yield* saveRunCheckpoint(run, {
             kind: 'committed',
             conversationId: parsed.conversationId,
             rootBlobIds: parsed.historyBlobIds,
@@ -106,10 +113,13 @@ export async function* handleSummarizeAction(
             summaryArchiveIds: parsed.historySummaryArchiveIds,
             tokenDetails: currentTokenDetails,
             mode: parsed.mode,
-            updatedAt: Date.now(),
         });
 
-        yield summaryCompleted(hookMessage ?? 'Conversation already compact enough.');
+        throwIfBlobRunInactive(run);
+        yield summaryCompleted(hookMessage ?? (compactionPlan.mode === 'disabled'
+            ? 'Compaction unavailable: system prompt plus reserves exceed this model\'s usable context window. Consider a larger-context model.'
+            : 'Conversation already compact enough.'));
+        throwIfBlobRunInactive(run);
         yield checkpoint(
             parsed.historyBlobIds,
             currentTokenDetails.usedTokens,
@@ -128,99 +138,19 @@ export async function* handleSummarizeAction(
         return;
     }
 
-    const summarySourceText = compactionPlan.summarizeEntries
-        .map(entry => formatMessageForSummary(entry.message))
-        .filter(text => text.length > 0)
-        .join('\n\n');
-
-    let summaryText = '';
-    const llmStartTime = Date.now();
-    logger.info({
+    const { artifacts, tokenDetails: compactedUsedTokens } = yield* executeCompaction({
+        run,
         conversationId: parsed.conversationId,
-        model: route.model,
-        sourceTextLen: summarySourceText.length,
-        summarizeEntries: compactionPlan.summarizeEntries.length,
-        keepTail: compactionPlan.keepTail.length,
-    }, '[SUMMARIZE] LLM summary starting');
-
-    let lastHeartbeatTime = Date.now();
-    try {
-        const llmStream = route.provider.stream({
-            model: route.model,
-            thinking: false,
-            messages: [
-                { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
-                { role: 'user', content: buildSummaryUserMessage(summarySourceText) },
-            ],
-        });
-
-        for await (const event of llmStream) {
-            if (event.type === 'text_delta') {
-                summaryText += event.text;
-                yield summary(event.text);
-            }
-            // LLM 生成期间持续 yield heartbeat, 防止客户端 stall detector 误判
-            if (Date.now() - lastHeartbeatTime >= 4000) {
-                yield heartbeat();
-                lastHeartbeatTime = Date.now();
-            }
-        }
-    } catch (error) {
-        logger.warn({ error: (error as Error).message, durationMs: Date.now() - llmStartTime }, '[SUMMARIZE] LLM failed, falling back to local summary');
-    }
-
-    logger.info({
-        conversationId: parsed.conversationId,
-        summaryLen: summaryText.length,
-        durationMs: Date.now() - llmStartTime,
-    }, '[SUMMARIZE] LLM summary done');
-
-    summaryText = summaryText.trim();
-    if (!summaryText) {
-        summaryText = summarySourceText
-            .split('\n')
-            .map(line => line.trim())
-            .filter(Boolean)
-            .slice(0, 12)
-            .map(line => `- ${line.replace(/^-\s*/, '')}`)
-            .join('\n')
-            .slice(0, 4000);
-    }
-    if (!summaryText) {
-        summaryText = '- Prior conversation compacted.';
-    }
-
-    const artifacts = createCompactionArtifacts({
+        origin: 'client_summarize',
         plan: compactionPlan,
-        summaryText,
-        previousSummaryArchiveIds: parsed.historySummaryArchiveIds,
-    });
-
-    yield kvMessage(1, artifacts.summaryBlobId, artifacts.summaryBlobData);
-    for (const [index, archiveBlob] of artifacts.archiveBlobs.entries()) {
-        yield kvMessage(2 + index, archiveBlob.blobId, archiveBlob.blobData, archiveBlob.blobDataRaw);
-    }
-
-    const compactedUsedTokens = clampTokenDetails(
-        estimateMessagesTokens([
-            ...compactionPlan.leading.map(entry => entry.message),
-            { role: 'assistant', content: `Previous conversation summary:\n${artifacts.summaryText}` },
-            ...compactionPlan.keepTail.map(entry => entry.message),
-        ]),
-        currentTokenDetails.maxTokens,
-    );
-
-    persistConversationCheckpoint({
-        kind: 'committed',
-        conversationId: parsed.conversationId,
-        rootBlobIds: artifacts.nextRootBlobIds,
+        route,
+        contextTokenLimit,
         turnBlobIds: parsed.historyTurnBlobIds,
-        summaryArchiveIds: artifacts.nextSummaryArchiveIds,
-        tokenDetails: compactedUsedTokens,
+        previousSummaryArchiveIds: parsed.historySummaryArchiveIds,
         mode: parsed.mode,
-        updatedAt: Date.now(),
     });
 
+    throwIfBlobRunInactive(run);
     yield checkpoint(
         artifacts.nextRootBlobIds,
         compactedUsedTokens.usedTokens,
@@ -236,5 +166,6 @@ export async function* handleSummarizeAction(
             gitRepos: parsed.gitRepos?.map(r => ({ path: r.path, branchName: r.branchName })),
         },
     );
+    throwIfBlobRunInactive(run);
     yield summaryCompleted(hookMessage ?? 'Chat context summarized.');
 }

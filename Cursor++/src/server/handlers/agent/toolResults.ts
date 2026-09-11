@@ -36,6 +36,7 @@ import {
     buildTaskExecToolResult,
     buildTaskToolResultText,
     normalizeTaskToolResult,
+    type TaskEntryTruncationContext,
 } from './toolkit/results/taskToolResults';
 import { obj, str, truncate, type ToolResultEnvelope } from './toolkit/results/shared';
 
@@ -107,6 +108,7 @@ export function buildToolResultText(
     cursorToolType: string,
     toolResult: ToolResultEnvelope,
     input: Record<string, unknown>,
+    entryTruncation?: TaskEntryTruncationContext,
 ): string {
     const result = obj(toolResult.result);
     const resultCaseName = str(result.case);
@@ -117,7 +119,7 @@ export function buildToolResultText(
         ?? buildSearchToolResultText(cursorToolType, resultCaseName, value, input)
         ?? buildFileToolResultText(cursorToolType, resultCaseName, value, input)
         ?? buildInteractionToolResultText(cursorToolType, toolResult, resultCaseName, value)
-        ?? (cursorToolType === 'taskToolCall' ? buildTaskToolResultText(resultCaseName, value) : null)
+        ?? (cursorToolType === 'taskToolCall' ? buildTaskToolResultText(resultCaseName, value, entryTruncation) : null)
         ?? (cursorToolType === 'communicateUpdateToolCall' ? 'Progress update recorded.' : null)
         ?? buildMcpToolResultText(cursorToolType, resultCaseName, value)
         ?? truncate(JSON.stringify(toolResult, null, 2), 12000);

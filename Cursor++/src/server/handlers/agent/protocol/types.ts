@@ -83,6 +83,10 @@ export interface ParsedRunRequest {
   userText: string
   modelId: string
   conversationId: string
+  /** Logical Cursor run/retry family; distinct from the transport attempt requestId. */
+  runId?: string
+  /** Correlation only; never a checkpoint or cancellation ownership key. */
+  conversationGroupId?: string
   /** 客户端本轮 RequestContext 传输形态，用于能力驱动的兼容切换。 */
   requestContextTransport: 'legacy' | 'dual' | 'ref_only'
   /** 由 3.17+ RunRequest capability fields 推导；旧客户端缺省为 false。 */
@@ -351,8 +355,6 @@ export interface ParsedRunRequest {
   historyBlobIds: string[]
   /** turns — ConversationTurnStructure blob IDs */
   historyTurnBlobIds: string[]
-  /** @deprecated 历史兼容别名；新代码使用 historyTurnBlobIds */
-  historyTurns: string[]
   /** summary_archives — 已压缩历史的 archive blob IDs */
   historySummaryArchiveIds: string[]
   historyTokenDetails?: { usedTokens: number, maxTokens: number }

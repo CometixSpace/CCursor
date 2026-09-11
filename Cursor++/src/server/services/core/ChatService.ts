@@ -57,7 +57,7 @@ export default (router: ConnectRouter) => {
             return summary;
         },
 
-        streamSpeculativeSummaries: async function* (req) {
+        async *streamSpeculativeSummaries(req) {
             const hydratedReq = await withPersistedPreviousSummary(req);
             const summaries = buildSpeculativeConversationSummaries(hydratedReq);
             await persistConversationSummaries(hydratedReq.conversationId, 'speculative', summaries);

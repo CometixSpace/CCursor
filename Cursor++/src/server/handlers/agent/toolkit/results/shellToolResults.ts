@@ -1,4 +1,4 @@
-import { envelope, num, obj, str, truncate, type ToolResultEnvelope } from './shared';
+import { envelope, num, str, truncate, type ToolResultEnvelope } from './shared';
 
 /**
  * Shell 输出截断阈值 — 对齐 cursor-agent-exec 的 `co` 累加器 (main.unminify.js:192898)。

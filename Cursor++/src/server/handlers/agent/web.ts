@@ -61,22 +61,6 @@ function htmlToMarkdown(html: string, sourceUrl: string): string {
   }
 }
 
-function fallbackStripHtml(html: string, sourceUrl: string): string {
-  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
-  const title = titleMatch ? decodeHtmlEntities(titleMatch[1].replace(/<[^>]+>/g, '')).trim() : sourceUrl
-  const body = decodeHtmlEntities(
-    html
-      .replace(/<script\b[\s\S]*?<\/script>/gi, ' ')
-      .replace(/<style\b[\s\S]*?<\/style>/gi, ' ')
-      .replace(/<br\s*\/?>/gi, '\n')
-      .replace(/<\/p>/gi, '\n\n')
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/\s{2,}/g, ' ')
-      .trim(),
-  ).slice(0, MAX_MARKDOWN_CHARS)
-  return `# ${title}\n\nSource: ${sourceUrl}\n\n${body}`
-}
-
 function decodeHtmlEntities(text: string): string {
   return text
     .replace(/&amp;/g, '&')
@@ -210,7 +194,7 @@ function decodeDuckDuckGoHref(href: string): string {
 
 // ── Search: multi-provider dispatch ──
 
-import type { FetchProviderConfig, SearchProviderEntry, WebToolsConfig } from '../../data/defaults'
+import type { SearchProviderEntry, WebToolsConfig } from '../../data/defaults'
 
 export type SearchRef = { title: string, url: string, chunk: string }
 
@@ -225,8 +209,9 @@ async function searchDuckDuckGo(searchTerm: string, max: number): Promise<Search
   const html = await response.text()
   const refs: SearchRef[] = []
   const regex = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]{0,1200}?(?:<a[^>]+class="result__snippet"[^>]*>|<div[^>]+class="result__snippet"[^>]*>)([\s\S]*?)(?:<\/a>|<\/div>)/gi
-  let match: RegExpExecArray | null
-  while ((match = regex.exec(html)) && refs.length < max) {
+  for (const match of html.matchAll(regex)) {
+    if (!(refs.length < max))
+      break
     const href = decodeDuckDuckGoHref(match[1])
     const title = stripTags(match[2])
     const chunk = stripTags(match[3]).slice(0, 400)
@@ -235,7 +220,9 @@ async function searchDuckDuckGo(searchTerm: string, max: number): Promise<Search
   }
   if (refs.length === 0) {
     const fallback = /<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi
-    while ((match = fallback.exec(html)) && refs.length < max) {
+    for (const match of html.matchAll(fallback)) {
+      if (!(refs.length < max))
+        break
       const href = decodeDuckDuckGoHref(match[1])
       const title = stripTags(match[2])
       if (href.startsWith('http') && title && title.length >= 3)

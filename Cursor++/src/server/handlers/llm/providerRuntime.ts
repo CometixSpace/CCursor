@@ -6,6 +6,7 @@ import { OpenAIResponsesProvider } from './openai-responses';
 import { GeminiProvider } from './gemini';
 import { resolveModel } from '../models/mapper';
 import { makeByokConnectError } from '../errors';
+import { withUsageRecording } from './usageRecorder';
 import { ErrorDetails_Error } from '../../gen/aiserver_v1_shared_pb';
 import type { ProviderStateStrategy } from './stateStrategy';
 import { anthropicStateStrategy, geminiStateStrategy, openAIStateStrategy } from './stateStrategy';
@@ -148,7 +149,14 @@ export function resolveProviderRuntime(modelId: string): ProviderRuntime {
         return mode ? filterToolsForMode(all, mode, isSubagent) : all;
     };
     return {
-        provider: getProviderForEntry(providerEntry),
+        // 用量采集埋点 (唯一): 包装缓存的 SDK client, 每次 resolve 新建轻量闭包,
+        // 底层 client 缓存机制不变 — agent 主循环 / 压缩摘要 / 子代理全部经此覆盖
+        provider: withUsageRecording(getProviderForEntry(providerEntry), {
+            providerId: providerEntry.id,
+            providerName: providerEntry.name,
+            modelId,
+            apiModel: resolved.apiModel,
+        }),
         stateStrategy,
         conversationCodec,
         promptProfile,

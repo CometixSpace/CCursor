@@ -51,7 +51,7 @@ export function parsePatch(patch: string): ParsedPatch | null {
       if (line.startsWith('+'))
         addLines.push(line.slice(1))
     }
-    return { action: 'add', path, addContents: addLines.join('\n') + '\n' }
+    return { action: 'add', path, addContents: `${addLines.join('\n')}\n` }
   }
 
   // *** Delete File: <path>
@@ -328,7 +328,7 @@ export function applyPatchToContent(patch: ParsedPatch, beforeContent: string): 
   // client read 会把 CRLF 归一化成 LF，client write 会按目标文件格式把 LF 恢复为 CRLF。
   // 因此 server 侧 ApplyPatch 结果必须保持 LF，不能按原文件 CRLF join，否则会被客户端二次转换为 \r\r\n。
   const content = normalizeTextForCursorWrite(beforeContent)
-  let originalLines = content.split('\n')
+  const originalLines = content.split('\n')
 
   // 去掉尾部空元素 (与 Codex 一致: split('\n') 对 "foo\n" 产生 ["foo", ""])
   if (originalLines.length > 0 && originalLines[originalLines.length - 1] === '')
@@ -337,7 +337,7 @@ export function applyPatchToContent(patch: ParsedPatch, beforeContent: string): 
   const replacements = computeReplacements(originalLines, patch.chunks ?? [])
   if (replacements.length === 0)
     throw new Error(`Patch did not apply to ${patch.path}: no hunks matched`)
-  let newLines = applyReplacements(originalLines, replacements)
+  const newLines = applyReplacements(originalLines, replacements)
 
   // 确保尾部换行
   if (newLines.length === 0 || newLines[newLines.length - 1] !== '')

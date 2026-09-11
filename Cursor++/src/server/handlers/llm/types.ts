@@ -12,6 +12,12 @@ export interface LLMMessage {
   toolCallId?: string
   toolName?: string
   isError?: boolean
+  /**
+   * 透传的 provider 元数据 (白名单: 仅 cursor.isSummary 摘要标记, 设计文档 §6 Q6)。
+   * 语义根治"旧摘要被当普通历史再次进摘要源+再次归档"的地板爬升问题;
+   * 修复链 (repair/materialize/flush) 通过 {...msg} 展开保留该字段。
+   */
+  providerOptions?: Record<string, unknown>
 }
 
 /** 内容块 (用于 assistant 消息中混合 text + tool_use) */
@@ -53,6 +59,8 @@ export interface LLMUsage {
 export interface LLMStreamRequest {
   model: string
   messages: LLMMessage[]
+  /** Cancellation for this run or request attempt, not the shared SDK client. */
+  signal?: AbortSignal
   tools?: LLMTool[]
   maxTokens?: number
   thinking?: boolean

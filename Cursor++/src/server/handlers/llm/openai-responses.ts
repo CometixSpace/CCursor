@@ -22,6 +22,7 @@ import { createProxiedFetch } from './proxyFetch'
 import { createTransformDiagnostics, hasTransformMutations, transformMessages } from './transformMessages'
 import { buildDefaultHeaders } from './userAgent'
 import type { LLMProvider, LLMStreamEvent, LLMStreamRequest } from './types'
+import { withProviderRequestLifecycle } from './requestLifecycle'
 
 export class OpenAIResponsesProvider implements LLMProvider {
   readonly name = 'openai-responses'
@@ -42,7 +43,11 @@ export class OpenAIResponsesProvider implements LLMProvider {
     this.client = new OpenAI(opts)
   }
 
-  async *stream(request: LLMStreamRequest): AsyncIterable<LLMStreamEvent> {
+  stream(request: LLMStreamRequest): AsyncIterable<LLMStreamEvent> {
+    return withProviderRequestLifecycle(lifecycle => this.streamRequest({ ...request, signal: lifecycle.signal }), request.signal)
+  }
+
+  private async *streamRequest(request: LLMStreamRequest): AsyncIterable<LLMStreamEvent> {
     const diagnostics = createTransformDiagnostics('openai-responses', request.messages.length)
     const transformed = transformMessages(request.messages, 'openai-responses', diagnostics, request.model)
     if (hasTransformMutations(diagnostics)) {
@@ -85,7 +90,7 @@ export class OpenAIResponsesProvider implements LLMProvider {
       params.include = ['reasoning.encrypted_content']
     }
 
-    const stream = await this.client.responses.create(params)
+    const stream = await this.client.responses.create(params, { signal: request.signal })
 
     // 跟踪活跃的 function_call items (item_id → { callId, name, hadDeltas })
     const activeCalls = new Map<string, { callId: string, name: string, hadDeltas: boolean }>()
