@@ -5,6 +5,7 @@ import { AgentServerMessageSchema } from '../gen/agent_v1_pb'
 import { execMessage, partialToolCall, toolCallCompleted, toolCallStarted } from '../handlers/agent/stream'
 import {
   buildExecToolResult,
+  buildLocalToolResult,
   buildToolResultText,
   isToolResultError,
   normalizeToolResult,
@@ -422,6 +423,39 @@ it('normalizeToolResult keeps updateTodos status values so Cursor can diff progr
   const todos = normalized.result.value.todos as Array<Record<string, unknown>>
   expect(todos[0]?.status).toBe(2)
   expect(todos[1]?.status).toBe('TODO_STATUS_COMPLETED')
+})
+
+it('goal tools map arguments and results onto their protocol shapes', () => {
+  const createResolved = resolveToolCall('CreateGoal', { objective: 'Finish remote setup' })
+  expect(createResolved.cursorToolType).toBe('createGoalToolCall')
+  expect(buildLocalToolResult(createResolved.cursorToolType, createResolved.sanitizedInput))
+    .toEqual({ result: { case: 'success', value: {} } })
+
+  const updateResolved = resolveToolCall('UpdateGoal', { status: 'complete' })
+  expect(updateResolved.cursorToolType).toBe('updateGoalToolCall')
+  expect(updateResolved.sanitizedInput.status).toBe(3)
+  const updateResult = buildLocalToolResult(updateResolved.cursorToolType, updateResolved.sanitizedInput)
+  expect(updateResult).toEqual({ result: { case: 'success', value: { status: 3 } } })
+  expect(buildToolResultText(updateResolved.cursorToolType, updateResult, updateResolved.sanitizedInput))
+    .toBe('Goal status updated to complete.')
+})
+
+it('goal tool frames serialize with the dedicated protobuf cases', () => {
+  const created = toolCallCompleted('call-create-goal', 'createGoalToolCall', {
+    objective: 'Finish remote setup',
+  }, {
+    result: { case: 'success', value: {} },
+  }, 'model-1')
+  expect(toJsonString(AgentServerMessageSchema, created)).toContain('"createGoalToolCall"')
+
+  const updated = toolCallCompleted('call-update-goal', 'updateGoalToolCall', {
+    status: 3,
+  }, {
+    result: { case: 'success', value: { status: 3 } },
+  }, 'model-1')
+  const json = toJsonString(AgentServerMessageSchema, updated)
+  expect(json).toContain('"updateGoalToolCall"')
+  expect(json).toContain('"status":"GOAL_STATUS_COMPLETE"')
 })
 
 it('task tool args serialize subagentType as official oneof shape', () => {

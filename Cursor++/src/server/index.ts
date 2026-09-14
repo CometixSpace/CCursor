@@ -8,6 +8,7 @@ import cors from '@fastify/cors'
  * 在 extension host 进程内运行，通过 startServer/stopServer 管理生命周期。
  */
 import Fastify from 'fastify'
+import { EXTENSION_VERSION, isNewerVersion } from '../version'
 import { ensureProvidersFile } from './config/providersStore'
 import { ensureRoutesFile, loadRoutes, toggleByokMode } from './config/routesStore'
 import { closeAgentDatabase, initDatabase } from './database/sqlite'
@@ -31,6 +32,15 @@ const TRACE_PATHS = new Set([
 ])
 
 let app: any = null
+
+export function isLoopbackAddress(address: string | undefined): boolean {
+  if (!address)
+    return false
+  const normalized = address.toLowerCase()
+  return normalized === '::1'
+    || normalized.startsWith('127.')
+    || normalized.startsWith('::ffff:127.')
+}
 
 // ── SSE 日志分发 (per-windowId) ──
 //
@@ -294,7 +304,31 @@ export async function startServer(opts: StartServerOptions): Promise<{ host: str
   })
 
   // Fake auth endpoints
-  server.get('/health', async () => ({ ok: true, mode: 'byok' }))
+  server.get('/health', async () => ({ ok: true, mode: 'byok', version: EXTENSION_VERSION }))
+
+  // Extension-host-only handoff. A newer extension may replace an older owner,
+  // while equal or older versions remain remote to avoid takeover loops.
+  server.post('/byok/takeover', async (req, reply) => {
+    if (req.headers.origin || !isLoopbackAddress(req.socket.remoteAddress)) {
+      return reply.code(403).send({ accepted: false, reason: 'only local extension hosts may request takeover' })
+    }
+
+    const requesterVersion = (req.body as { requesterVersion?: unknown } | null)?.requesterVersion
+    if (typeof requesterVersion !== 'string' || !isNewerVersion(requesterVersion, EXTENSION_VERSION)) {
+      return reply.code(409).send({
+        accepted: false,
+        ownerVersion: EXTENSION_VERSION,
+        reason: 'requester must be newer than the current owner',
+      })
+    }
+
+    reply.raw.once('finish', () => {
+      void stopServer(requesterVersion).catch((error) => {
+        logger.error({ err: error }, '[SRV] version takeover shutdown failed')
+      })
+    })
+    return reply.code(202).send({ accepted: true, ownerVersion: EXTENSION_VERSION })
+  })
 
   server.get('/auth/full_stripe_profile', async () => ({
     membershipType: 'ultra',
@@ -349,31 +383,33 @@ export async function startServer(opts: StartServerOptions): Promise<{ host: str
   return { host, port }
 }
 
-export function broadcastShutdown(): void {
-  const msg = `event: shutdown\ndata: {}\n\n`
+export function broadcastShutdown(takeoverVersion?: string): void {
+  const msg = `event: shutdown\ndata: ${JSON.stringify({ takeoverVersion })}\n\n`
   for (const [, streams] of logStreams) {
     for (const reply of streams) {
       try {
-        reply.raw.write(msg)
+        reply.raw.end(msg)
       }
       catch { /* noop */ }
     }
   }
   for (const reply of refreshEventStreams) {
     try {
-      reply.raw.write(msg)
+      reply.raw.end(msg)
     }
     catch { /* noop */ }
   }
+  logStreams.clear()
+  refreshEventStreams.clear()
   logger.info('[SRV] shutdown broadcast sent')
 }
 
-export async function stopServer(): Promise<void> {
+export async function stopServer(takeoverVersion?: string): Promise<void> {
   if (!app)
     return
   const server = app
   app = null
-  broadcastShutdown()
+  broadcastShutdown(takeoverVersion)
   try {
     await server.close()
   }

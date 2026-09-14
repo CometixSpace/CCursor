@@ -23,6 +23,8 @@ export type CursorToolType =
     | 'generateImageToolCall'
     | 'switchModeToolCall'
     | 'createPlanToolCall'
+    | 'createGoalToolCall'
+    | 'updateGoalToolCall'
     | 'semSearchToolCall';
 
 /**

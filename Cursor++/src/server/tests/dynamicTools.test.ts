@@ -17,6 +17,7 @@ import {
   toDynamicNamespace,
   validateDynamicToolsQuery,
 } from '../handlers/agent/dynamicTools'
+import { filterToolsForMode } from '../handlers/agent/toolkit/types'
 
 /**
  * GetDynamicTools 渲染层 —— 1:1 复刻校验。
@@ -399,10 +400,12 @@ describe('内置工具 final profile 分区', () => {
       'ListMcpResources',
     ]))
     expect(dynamicNames).toEqual(expect.arrayContaining([
+      'CreateGoal',
       'Task',
       'TodoWrite',
       'ReadLints',
       'FetchMcpResource',
+      'UpdateGoal',
     ]))
     expect(dynamicNames).not.toContain('GetDynamicTools')
     expect(dynamicNames).not.toContain('CallDynamicTool')
@@ -461,6 +464,16 @@ describe('内置工具 final profile 分区', () => {
     const result = partitionCursorBuiltinTools(tools, false)
     expect(result.staticTools).toEqual(tools)
     expect(result.dynamicTools).toEqual([])
+  })
+
+  it('目标管理工具只提供给主代理', () => {
+    const tools = getCursorAgentTools('anthropic')
+    const mainNames = filterToolsForMode(tools, 'agent').map(item => item.name)
+    const subagentNames = filterToolsForMode(tools, 'agent', true).map(item => item.name)
+
+    expect(mainNames).toEqual(expect.arrayContaining(['CreateGoal', 'UpdateGoal']))
+    expect(subagentNames).not.toContain('CreateGoal')
+    expect(subagentNames).not.toContain('UpdateGoal')
   })
 
   it('仅在显式 3.17 能力、meta-MCP 或已启用会话中切到 final', () => {

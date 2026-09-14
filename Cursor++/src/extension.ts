@@ -11,8 +11,9 @@ import { resetProviderInstanceCache } from './server/handlers/llm/providerRuntim
 import { initLogger } from './server/logger'
 import { getRoutesFilePath } from './server/routes'
 import { PanelProvider } from './ui/panel-provider'
-import { getState, onStateChange, probeByokServer, refreshState, setFileLogState } from './ui/state'
+import { getState, onStateChange, probeByokServer, refreshState, requestByokServerTakeover, setFileLogState } from './ui/state'
 import { startUpdateCheck, stopUpdateCheck } from './update-check'
+import { EXTENSION_VERSION, isNewerVersion } from './version'
 
 let outputChannel: vscode.LogOutputChannel
 let statusBarItem: vscode.StatusBarItem
@@ -179,6 +180,8 @@ function parseWindowId(): number | null {
 let sseRequest: http.ClientRequest | null = null
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null
 let takeoverInProgress = false
+let skipNextDisconnectTakeover = false
+let legacyOwnerWarningShown = false
 
 function connectLogStream(port: number, windowId: number) {
   disconnectLogStream()
@@ -202,6 +205,21 @@ function connectLogStream(port: number, windowId: number) {
             continue // SSE comment
         }
         if (eventType === 'shutdown') {
+          let takeoverVersion: string | undefined
+          try {
+            const data = JSON.parse(dataLine) as { takeoverVersion?: unknown }
+            if (typeof data.takeoverVersion === 'string')
+              takeoverVersion = data.takeoverVersion
+          }
+          catch { /* legacy shutdown payload */ }
+
+          if (takeoverVersion && isNewerVersion(takeoverVersion, EXTENSION_VERSION)) {
+            skipNextDisconnectTakeover = true
+            log('info', `[TAKEOVER] yielding server ownership to newer version ${takeoverVersion}`)
+            startHeartbeat()
+            return
+          }
+
           log('info', '[TAKEOVER] shutdown signal received')
           attemptTakeover()
           return
@@ -239,6 +257,13 @@ function disconnectLogStream() {
 }
 
 async function onSseDisconnect() {
+  if (skipNextDisconnectTakeover) {
+    skipNextDisconnectTakeover = false
+    await refreshState()
+    renderStatusBar()
+    startHeartbeat()
+    return
+  }
   if (getState().server === 'local')
     return // owner 自己关闭,不需要接管
   const cfg = getServerConfig()
@@ -276,12 +301,17 @@ async function attemptTakeover() {
     await doStartServer()
     await refreshState()
     renderStatusBar()
-    stopHeartbeat()
     if (myWindowId !== null) {
       const cfg = getServerConfig()
       connectLogStream(cfg.port, myWindowId)
     }
-    log('info', '[TAKEOVER] this window is now the server owner')
+    if (getState().server === 'local') {
+      stopHeartbeat()
+      log('info', '[TAKEOVER] this window is now the server owner')
+    }
+    else {
+      startHeartbeat()
+    }
   }
   catch {
     await refreshState()
@@ -310,6 +340,22 @@ function startHeartbeat() {
     if (probe.kind === 'offline') {
       log('info', '[HEARTBEAT] server unreachable, attempting takeover...')
       attemptTakeover()
+    }
+    else if (probe.kind === 'byok') {
+      if (getState().server !== 'remote') {
+        await refreshState()
+        renderStatusBar()
+      }
+      if (probe.version && isNewerVersion(EXTENSION_VERSION, probe.version)) {
+        log('info', `[HEARTBEAT] older server version ${probe.version} detected, attempting takeover...`)
+        attemptTakeover()
+      }
+      else if (!probe.version) {
+        warnLegacyOwner()
+      }
+      else if (!sseRequest && myWindowId !== null) {
+        connectLogStream(cfg.port, myWindowId)
+      }
     }
     else if (probe.kind === 'occupied') {
       log('warn', `[SRV] port ${cfg.port} is occupied by another process (${probe.reason})`)
@@ -396,13 +442,65 @@ async function waitForRemoteByokServer(host: string, port: number, attempts = 8)
   return false
 }
 
+function warnLegacyOwner(): void {
+  if (legacyOwnerWarningShown)
+    return
+  legacyOwnerWarningShown = true
+  const message = 'Cursor++ server is owned by an older extension that cannot hand off automatically. Close all Cursor windows once, then reopen the project.'
+  log('warn', `[TAKEOVER] ${message}`)
+  void vscode.window.showWarningMessage(message)
+}
+
+async function waitForRemoteOwnerChange(host: string, port: number, ownerVersion: string, attempts = 20): Promise<void> {
+  for (let i = 0; i < attempts; i++) {
+    await new Promise(resolve => setTimeout(resolve, 100))
+    const probe = await probeByokServer(host, port)
+    if (probe.kind === 'offline')
+      return
+    if (probe.kind === 'byok' && probe.version !== ownerVersion)
+      return
+  }
+}
+
 async function doStartServer() {
   const cfg = getServerConfig()
 
   await refreshState()
-  const s = getState()
+  let s = getState()
   if (s.server === 'local') {
     log('warn', '[SRV] server already running in this instance')
+    return
+  }
+  if (s.server === 'remote') {
+    const probe = await probeByokServer(cfg.host, cfg.port)
+    if (probe.kind === 'byok') {
+      if (probe.version && isNewerVersion(EXTENSION_VERSION, probe.version)) {
+        log('info', `[TAKEOVER] requesting handoff from server version ${probe.version} to ${EXTENSION_VERSION}`)
+        const accepted = await requestByokServerTakeover(cfg.host, cfg.port, EXTENSION_VERSION)
+        if (!accepted) {
+          log('warn', `[TAKEOVER] server version ${probe.version} rejected the handoff request`)
+          startHeartbeat()
+          return
+        }
+        await waitForRemoteOwnerChange(cfg.host, cfg.port, probe.version)
+        await refreshState()
+        s = getState()
+      }
+      else {
+        if (!probe.version)
+          warnLegacyOwner()
+        log('info', `[SRV] port ${cfg.port} claimed by another Cursor++ instance, running as remote`)
+        startHeartbeat()
+        return
+      }
+    }
+    else {
+      await refreshState()
+      s = getState()
+    }
+  }
+  if (s.server === 'local') {
+    stopHeartbeat()
     return
   }
   if (s.server === 'remote') {

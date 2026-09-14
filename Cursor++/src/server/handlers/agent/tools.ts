@@ -77,6 +77,19 @@ const TODO_STATUS_MAP: Record<string, number> = {
     'cancelled': 4,
 };
 
+const GOAL_STATUS_MAP: Record<string, number> = {
+    'GOAL_STATUS_UNSPECIFIED': 0,
+    'GOAL_STATUS_ACTIVE': 1,
+    'GOAL_STATUS_PAUSED': 2,
+    'GOAL_STATUS_COMPLETE': 3,
+    'GOAL_STATUS_CLEARED': 4,
+    'active': 1,
+    'paused': 2,
+    'complete': 3,
+    'completed': 3,
+    'cleared': 4,
+};
+
 /**
  * 将 LLM tool_use input 中的字符串枚举转换为 proto 兼容的 int32
  *
@@ -93,6 +106,12 @@ export function sanitizeToolInput(toolName: string, input: Record<string, unknow
                     ? (TODO_STATUS_MAP[todo.status] ?? 0)
                     : todo.status,
             })),
+        };
+    }
+    if ((toolName === 'UpdateGoal' || toolName === 'update_goal') && typeof input.status === 'string') {
+        return {
+            ...input,
+            status: GOAL_STATUS_MAP[input.status] ?? 0,
         };
     }
     return input;

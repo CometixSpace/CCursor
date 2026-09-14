@@ -61,6 +61,8 @@ const CANONICAL_INTENTS: CanonicalToolIntent[] = [
     { id: 'generate_image', aliases: ['GenerateImage', 'generate_image'] },
     { id: 'switch_mode', aliases: ['SwitchMode', 'switch_mode'] },
     { id: 'await', aliases: ['AwaitShell', 'Await', 'await'] },
+    { id: 'create_goal', aliases: ['CreateGoal', 'create_goal'] },
+    { id: 'update_goal', aliases: ['UpdateGoal', 'update_goal'] },
 ];
 
 class StaticProviderToolCatalog implements ProviderToolCatalog {

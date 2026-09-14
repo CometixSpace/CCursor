@@ -7,13 +7,12 @@
 import type { ByokMode, ProviderEntry } from '../server/data/defaults'
 import * as net from 'node:net'
 import * as vscode from 'vscode'
-import { version as EXTENSION_VERSION } from '../../package.json'
 import { isServerRunning } from '../server'
 import { getServerConfig } from '../server/config'
 import { loadProviders } from '../server/config/providersStore'
 import { getByokMode } from '../server/config/routesStore'
-
 import { getWebTools } from '../server/config/searchConfigStore'
+import { EXTENSION_VERSION } from '../version'
 
 export type ServerState = 'local' | 'remote' | 'offline'
 
@@ -81,7 +80,7 @@ export function isPortReachable(host: string, port: number): Promise<boolean> {
 }
 
 export type ServerProbeResult
-  = | { kind: 'byok' }
+  = | { kind: 'byok', version?: string }
     | { kind: 'offline' }
     | { kind: 'occupied', reason: string }
 
@@ -95,8 +94,12 @@ export async function probeByokServer(host: string, port: number): Promise<Serve
   try {
     const response = await fetch(`http://${host}:${port}/health`, { signal: controller.signal })
     const data = await response.json().catch(() => null) as any
-    if (response.ok && data?.ok === true && data?.mode === 'byok')
-      return { kind: 'byok' }
+    if (response.ok && data?.ok === true && data?.mode === 'byok') {
+      const version = typeof data.version === 'string' && data.version.length > 0
+        ? data.version
+        : undefined
+      return { kind: 'byok', version }
+    }
     // HTTP 响应了但不是 BYOK server — 真正被占用
     return { kind: 'occupied', reason: `unexpected /health response: HTTP ${response.status}` }
   }
@@ -105,6 +108,27 @@ export async function probeByokServer(host: string, port: number): Promise<Serve
     // 不判定为 occupied — 可能是 Windows 网络栈假阳性或 always-local patch 干扰。
     // 让 Fastify listen 的 EADDRINUSE 做最终仲裁。
     return { kind: 'offline' }
+  }
+  finally {
+    clearTimeout(timer)
+  }
+}
+
+export async function requestByokServerTakeover(host: string, port: number, requesterVersion: string): Promise<boolean> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 1000)
+  try {
+    const response = await fetch(`http://${host}:${port}/byok/takeover`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requesterVersion }),
+      signal: controller.signal,
+    })
+    const data = await response.json().catch(() => null) as any
+    return response.status === 202 && data?.accepted === true
+  }
+  catch {
+    return false
   }
   finally {
     clearTimeout(timer)

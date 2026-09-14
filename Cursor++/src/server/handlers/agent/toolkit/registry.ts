@@ -29,6 +29,8 @@ import { GetDynamicToolsTool } from './definitions/GetDynamicTools';
 import { ApplyPatchTool } from './definitions/ApplyPatch';
 import { CreatePlanTool } from './definitions/CreatePlan';
 import { UpdateCurrentStepTool } from './definitions/UpdateCurrentStep';
+import { CreateGoalTool } from './definitions/CreateGoal';
+import { UpdateGoalTool } from './definitions/UpdateGoal';
 // SemanticSearch 暂不注册 — BYOK server 无 retrieval 后端,
 // 下发给 LLM 只会产生无意义的工具调用。待实现 retrieval 服务后恢复。
 // import { SemanticSearchTool } from './definitions/SemanticSearch';
@@ -59,6 +61,8 @@ const TOOL_REGISTRY: ToolRegistryEntry[] = [
     CallMcpToolTool,
     GetDynamicToolsTool,
     CreatePlanTool,
+    CreateGoalTool,
+    UpdateGoalTool,
     // SemanticSearchTool,
 ];
 

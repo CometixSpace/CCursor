@@ -51,9 +51,16 @@ const SUBAGENT_ONLY_TOOLS = new Set([
     'updateCurrentStep',
 ]);
 
+const MAIN_AGENT_ONLY_TOOLS = new Set([
+    'CreateGoal',
+    'UpdateGoal',
+]);
+
 export function filterToolsForMode(tools: LLMTool[], mode: string, isSubagent = false): LLMTool[] {
     const normalized = mode.replace('AGENT_MODE_', '').toLowerCase() as CursorAgentMode;
-    const filtered = isSubagent ? tools : tools.filter(t => !SUBAGENT_ONLY_TOOLS.has(t.name));
+    const filtered = isSubagent
+        ? tools.filter(t => !MAIN_AGENT_ONLY_TOOLS.has(t.name))
+        : tools.filter(t => !SUBAGENT_ONLY_TOOLS.has(t.name));
     switch (normalized) {
         case 'ask':
             return filtered.filter(t => !ASK_MODE_EXCLUDED_TOOLS.has(t.name) && t.name !== 'CreatePlan');

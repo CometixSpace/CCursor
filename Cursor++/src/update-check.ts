@@ -5,7 +5,7 @@
  * 与当前 extension 版本比较，有更新时弹通知。
  */
 import * as vscode from 'vscode'
-import { version as CURRENT_VERSION } from '../package.json'
+import { compareVersions, EXTENSION_VERSION } from './version'
 
 const NPM_PACKAGE = '@cometix/ccursor'
 const REGISTRY_URL = `https://registry.npmjs.org/${NPM_PACKAGE}/latest`
@@ -18,19 +18,7 @@ const STATE_KEY_DISMISSED = 'ccursor.updateCheck.dismissedVersion'
 let timer: ReturnType<typeof setInterval> | null = null
 
 function getCurrentVersion(): string {
-  return CURRENT_VERSION
-}
-
-function compareVersions(a: string, b: string): number {
-  const pa = a.split('.').map(Number)
-  const pb = b.split('.').map(Number)
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const va = pa[i] ?? 0
-    const vb = pb[i] ?? 0
-    if (va !== vb)
-      return va - vb
-  }
-  return 0
+  return EXTENSION_VERSION
 }
 
 async function fetchLatestVersion(): Promise<string | null> {

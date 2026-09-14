@@ -25,6 +25,18 @@ export function buildLocalInteractionToolResult(cursorToolType: string, input: R
                 },
             };
         }
+        case 'createGoalToolCall': {
+            const objective = str(input.objective).trim();
+            return objective
+                ? { result: { case: 'success', value: {} } }
+                : { result: { case: 'error', value: { error: 'Goal objective must not be empty.' } } };
+        }
+        case 'updateGoalToolCall': {
+            const status = enumLike(input.status, 0);
+            return typeof status === 'number' && status >= 1 && status <= 4
+                ? { result: { case: 'success', value: { status } } }
+                : { result: { case: 'error', value: { error: 'Goal status must be active, paused, complete, or cleared.' } } };
+        }
         case 'webSearchToolCall':
             return { result: { case: 'error', value: { error: 'web search is not implemented yet' } } };
         case 'webFetchToolCall':
@@ -108,6 +120,14 @@ export function normalizeInteractionToolResult(
                 });
             }
             return envelope(resultCaseName || 'error', value);
+        case 'createGoalToolCall':
+            return resultCaseName === 'success'
+                ? envelope('success', {})
+                : envelope(resultCaseName || 'error', { error: str(value.error, 'Failed to create goal.') });
+        case 'updateGoalToolCall':
+            return resultCaseName === 'success'
+                ? envelope('success', { status: enumLike(value.status, enumLike(input.status, 0)) })
+                : envelope(resultCaseName || 'error', { error: str(value.error, 'Failed to update goal.') });
         default:
             return null;
     }
@@ -126,6 +146,17 @@ export function buildInteractionToolResultText(
                 return truncate(todos.map(todo => `- [${String(enumLike(todo.status, ''))}] ${str(todo.content)} (${str(todo.id)})`).join('\n') || 'Updated todos');
             }
             return `Update todos ${resultCaseName || 'error'}: ${JSON.stringify(value)}`;
+        }
+        case 'createGoalToolCall':
+            return resultCaseName === 'success'
+                ? 'Goal created.'
+                : `Create goal ${resultCaseName || 'error'}: ${str(value.error, 'unknown error')}`;
+        case 'updateGoalToolCall': {
+            if (resultCaseName !== 'success')
+                return `Update goal ${resultCaseName || 'error'}: ${str(value.error, 'unknown error')}`;
+            const status = enumLike(value.status, 0);
+            const labels: Record<number, string> = { 1: 'active', 2: 'paused', 3: 'complete', 4: 'cleared' };
+            return `Goal status updated to ${typeof status === 'number' ? (labels[status] ?? 'unspecified') : status}.`;
         }
         case 'webSearchToolCall':
         case 'webFetchToolCall':
