@@ -7,6 +7,8 @@
  *   - clientVersionStatus: 客户端版本检查 (updateLevel=NONE 阻止更新提示)
  *   - useNlbForNal: 网络负载均衡 (NAL = cursor-always-local)
  *   - agentUrlConfig: Agent 服务 URL (BYOK 指向本地)
+ *   - http2Config: 必须显式回 FORCE_BIDI_DISABLED, 否则客户端会走 BiDi Run 打本地
+ *     HTTP/1.1 server (HTTP 505) —— 详见下方字段处的注释
  *   - claudeCodeHooksEnabled: Claude Code hooks 开关
  *   - metricsConfig: 指标采集开关 (隐私模式+非隐私模式)
  *   - backgroundComposerConfig: 后台 Agent 配置
@@ -18,6 +20,7 @@
  */
 
 import { config } from '../../runtime-config';
+import { Http2Config } from '../../gen/aiserver_v1_pb';
 
 export function buildServerConfig() {
     const byokUrl = `http://${config.server.host}:${config.server.port}`;
@@ -69,6 +72,29 @@ export function buildServerConfig() {
         },
 
         configVersion: 'da2221eb-11d4-4bfa-b704-f76111f1e801',
+
+        /**
+         * http2_config = 7 —— 必须显式回 FORCE_BIDI_DISABLED(3), 不能省略。
+         *
+         * 背景: BYOK 的 agentUrlConfig 把 Agent 服务指向本地, 而本地 server 是
+         * Fastify over HTTP/1.1, **无法承载 BiDi streaming** (agent.v1.AgentService/Run)。
+         * 实测对 HTTP/1.1 的 bidi 请求, 服务端直接回 `HTTP 505 HTTP Version Not Supported`,
+         * 响应体为空 —— 客户端 Connect 层解不出任何信封, 只能抛
+         * `Code.Internal` + "Protocol error", 即 UI 上的
+         * `RetriableError: [internal] Protocol error`。
+         *
+         * 该错误发生在 RPC 方法选择阶段, 早于任何 LLM 调用, 因此**与 provider / 模型
+         * 完全无关** —— 换任何模型都报同一个错, 且服务端日志里连
+         * `[SVC] AgentService/Run bidi started` 都不会出现。
+         *
+         * 置为 FORCE_BIDI_DISABLED 后客户端改走 server streaming 的 RunSSE
+         * (HTTP/1.1 可用), 配合 unary 的 aiserver.v1.BidiService/BidiAppend 投递
+         * runRequest, 这正是本扩展设计的传输路径。
+         *
+         * 不要改用 FORCE_ALL_DISABLED(1): 那会连非 bidi 的 HTTP/2 能力一起关掉,
+         * 而本地只需要关 bidi。
+         */
+        http2Config: Http2Config.FORCE_BIDI_DISABLED,
 
         profilingConfig: {},
 
