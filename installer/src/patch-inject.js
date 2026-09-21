@@ -22,17 +22,19 @@ export function isInjectPatched(code) {
 }
 // ConnectRPC 客户端模块的 esbuild 注册键。
 //
-// 3.17.8 起构建把模块路径从完整路径缩短成纯文件名:
+// 3.17.8 起构建变更了模块注册键格式:
 //   ≤3.16.29  "out-build/external/bufbuild/connect/callback-client.js"
-//   ≥3.17.8   "callback-client.js"
-// 同一次变更让 bundle 里的 "bufbuild" 从 106 处降到 3 处、"connectrpc" 归零 ——
-// 是构建配置改了,不是换掉了 ConnectRPC 库(BiDiStreaming/ServerStreaming 数量不变)。
+//   ≥3.17.8   部分构建为纯文件名 "callback-client.js"，部分打包产物去除了 .js 后缀
+//             保留路径如 "bufbuild/connect/callback-client" 与 "bufbuild/connect/promise-client"
 //
-// 所以锚点只取文件名部分: 对新版精确命中,对旧版作为完整路径的后缀同样命中,
-// 一份锚点覆盖两种形态。
+// 因此锚点列表同时包含带 .js、不带 .js 的模块键及纯文件名回退，确保在各构建形态下均能准确命中。
 const ANCHORS = [
   'callback-client.js',
   'promise-client.js',
+  'bufbuild/connect/callback-client',
+  'bufbuild/connect/promise-client',
+  'callback-client',
+  'promise-client',
 ];
 const SCAN_WINDOW = 2000;
 

@@ -33,9 +33,8 @@ export async function check() {
       continue;
     }
     const wb = readFileSync(file, 'utf-8');
-    // 与 patch-inject.js 的 ANCHORS 保持一致 —— 3.17.8 起模块注册键从
-    // "out-build/external/bufbuild/connect/callback-client.js" 缩短为
-    // "callback-client.js",只取文件名可同时命中新旧两种形态。
+    // 与 patch-inject.js 的 ANCHORS 保持一致 —— 兼容不同版本及打包环境下
+    // 包含/不包含 .js 后缀或带路径前缀的 ConnectRPC 客户端模块键。
     if (isInjectPatched(wb)) {
       console.log(ok(`Renderer hook (${label}): payload + active transport call site`));
       continue;
@@ -48,6 +47,10 @@ export async function check() {
     const anchors = [
       'callback-client.js',
       'promise-client.js',
+      'bufbuild/connect/callback-client',
+      'bufbuild/connect/promise-client',
+      'callback-client',
+      'promise-client',
     ];
     const found = anchors.find(a => wb.includes(a));
     if (found) {
