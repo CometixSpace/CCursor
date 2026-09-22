@@ -8,7 +8,8 @@
  *   - useNlbForNal: 网络负载均衡 (NAL = cursor-always-local)
  *   - agentUrlConfig: Agent 服务 URL (BYOK 指向本地)
  *   - http2Config: 必须显式回 FORCE_BIDI_DISABLED, 否则客户端会走 BiDi Run 打本地
- *     HTTP/1.1 server (HTTP 505) —— 详见下方字段处的注释
+ *     HTTP/1.1 server (HTTP 505)。实测于 Cursor 3.20.21; 行为切换的精确版本
+ *     尚未定论, 区间依据见下方字段处注释
  *   - claudeCodeHooksEnabled: Claude Code hooks 开关
  *   - metricsConfig: 指标采集开关 (隐私模式+非隐私模式)
  *   - backgroundComposerConfig: 后台 Agent 配置
@@ -75,6 +76,19 @@ export function buildServerConfig() {
 
         /**
          * http2_config = 7 —— 必须显式回 FORCE_BIDI_DISABLED(3), 不能省略。
+         *
+         * ── 行为变动的版本边界 ──
+         * 实测(事实): 故障在 Cursor 3.20.21 (commit f09fca3, 2026-09-13 构建) 上复现。
+         *
+         * 下界(推断, 依据两条): 扩展源码中标注过的最高 Cursor 版本为 3.17.19;
+         * 且 `agent.v1.AgentService/RunSSE` 自 v0.0.6 起就在 BYOK 重定向白名单里,
+         * 而 `Run` 从未进入白名单 —— 说明此前客户端实际走的是 RunSSE, 否则本扩展
+         * 不可能工作。承载该选择逻辑的 AiConnectTransportHandler 位于 Agent Host,
+         * 仓库中标注为 3.13+ 组件。
+         *
+         * 结论: 行为切换发生在 (3.17.19, 3.20.21] 区间内。精确到某一版本需要用旧版
+         * 构建二分, 本地无旧构建, 故未定论。此赋值对不消费该字段的旧版本无副作用,
+         * 只在消费它的版本上把客户端引回 RunSSE。
          *
          * 背景: BYOK 的 agentUrlConfig 把 Agent 服务指向本地, 而本地 server 是
          * Fastify over HTTP/1.1, **无法承载 BiDi streaming** (agent.v1.AgentService/Run)。
