@@ -47,6 +47,66 @@ function toEntries(messages: LLMMessage[]): HistoryEntry[] {
   return messages.map((message, index) => makeEntry(index, message))
 }
 
+function syntheticToolChain(rounds: number, toolsPerRound: number): LLMMessage[] {
+  const messages: LLMMessage[] = [
+    { role: 'assistant', content: 'Previous conversation summary:\nSynthetic progress.' },
+    { role: 'user', content: 'Inspect the synthetic fixture.' },
+  ]
+  for (let round = 0; round < rounds; round++) {
+    const calls = Array.from({ length: toolsPerRound }, (_, index) => ({
+      type: 'tool_use' as const,
+      id: `call-${round}-${index}`,
+      name: 'Read',
+      input: { path: 'fixture.ts' },
+    }))
+    messages.push({ role: 'assistant', content: calls })
+    for (const call of calls) {
+      messages.push({ role: 'tool', toolCallId: call.id, content: 'Synthetic tool result.' })
+    }
+  }
+  return messages
+}
+
+function expectCompleteToolGroups(entries: HistoryEntry[]) {
+  const pending = new Set<string>()
+  for (const { message } of entries) {
+    if (message.role !== 'tool')
+      expect(pending.size).toBe(0)
+    if (message.role === 'assistant' && Array.isArray(message.content)) {
+      for (const block of message.content) {
+        if (block.type === 'tool_use')
+          pending.add(block.id)
+      }
+    }
+    if (message.role === 'tool')
+      expect(pending.delete(message.toolCallId!)).toBe(true)
+  }
+  expect(pending.size).toBe(0)
+}
+
+it('compacts old tool rounds without pulling the entire chain into the retained tail', () => {
+  const entries = toEntries(syntheticToolChain(64, 1))
+  const plan = planCompaction(entries)
+  expect(plan.summarizeEntries.length).toBeGreaterThan(100)
+  expect(plan.keepTail).toHaveLength(6)
+  expect(plan.keepTail[0].message.role).toBe('assistant')
+  expectCompleteToolGroups(plan.summarizeEntries)
+  expectCompleteToolGroups(plan.keepTail)
+  expect([...plan.leading, ...plan.summarizeEntries, ...plan.keepTail]).toEqual(entries)
+})
+
+it('keeps single and parallel tool calls paired on both sides of varied split boundaries', () => {
+  for (let rounds = 1; rounds <= 24; rounds++) {
+    for (let toolsPerRound = 1; toolsPerRound <= 8; toolsPerRound++) {
+      const entries = toEntries(syntheticToolChain(rounds, toolsPerRound))
+      const plan = planCompaction(entries)
+      expectCompleteToolGroups(plan.summarizeEntries)
+      expectCompleteToolGroups(plan.keepTail)
+      expect([...plan.leading, ...plan.summarizeEntries, ...plan.keepTail]).toEqual(entries)
+    }
+  }
+})
+
 it('diagnostic: summarize-path planCompaction can still split legacy anthropic assistant/tool_result boundary before repair', () => {
   const entries = buildLegacyCompactionEntries()
   const plan = planCompaction(entries)
@@ -66,18 +126,17 @@ it('after repairConversationHistory canonicalizes legacy anthropic tool results,
 
   expect(plan.leading.map(entry => entry.message.role)).toEqual(['system', 'user'])
   expect(plan.summarizeEntries.some(entry => hasToolUse(entry.message))).toBe(false)
-  expect(plan.keepTail[0]?.message.role).toBe('user')
-  expect(plan.keepTail[1]?.message.role).toBe('assistant')
-  expect(hasToolUse(plan.keepTail[1]!.message)).toBe(true)
-  expect(plan.keepTail[2]?.message.role).toBe('tool')
-  expect(plan.keepTail[2]?.message.toolCallId).toBe('call_A')
+  expect(plan.keepTail[0]?.message.role).toBe('assistant')
+  expect(hasToolUse(plan.keepTail[0]!.message)).toBe(true)
+  expect(plan.keepTail[1]?.message.role).toBe('tool')
+  expect(plan.keepTail[1]?.message.toolCallId).toBe('call_A')
 })
 
 it('runtime helper repairHistoryEntries materializes canonicalized entries before compaction planning', () => {
   const plan = planCompaction(repairHistoryEntries(buildLegacyCompactionEntries()))
 
-  expect(plan.keepTail[1]?.message.role).toBe('assistant')
-  expect(hasToolUse(plan.keepTail[1]!.message)).toBe(true)
-  expect(plan.keepTail[2]?.message.role).toBe('tool')
-  expect(plan.keepTail[2]?.message.toolCallId).toBe('call_A')
+  expect(plan.keepTail[0]?.message.role).toBe('assistant')
+  expect(hasToolUse(plan.keepTail[0]!.message)).toBe(true)
+  expect(plan.keepTail[1]?.message.role).toBe('tool')
+  expect(plan.keepTail[1]?.message.toolCallId).toBe('call_A')
 })
