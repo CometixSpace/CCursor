@@ -113,6 +113,8 @@ export interface RoutesConfig {
   server: { host: string, port: number }
   collector: { host: string, port: number }
   redirect: string[]
+  /** Opt-in model IDs whose Agent loop and compaction are owned by Cursor. */
+  nativeInferenceModels?: string[]
 }
 
 export const DEFAULT_ROUTES: RoutesConfig = {
@@ -124,9 +126,14 @@ export const DEFAULT_ROUTES: RoutesConfig = {
 }
 
 /** 根据 byokMode 计算最终 redirect 数组 */
-export function buildRedirectForMode(mode: ByokMode): string[] {
+export const NATIVE_INFERENCE_REDIRECT = [
+  'aiserver.v1.InferenceService/Stream',
+  'aiserver.v1.InferenceService/RunInferenceSSE',
+]
+
+export function buildRedirectForMode(mode: ByokMode, nativeInferenceModels: string[] = []): string[] {
   return mode
-    ? [...BASE_REDIRECT, ...BYOK_REDIRECT]
+    ? [...BASE_REDIRECT, ...BYOK_REDIRECT, ...(nativeInferenceModels.length ? NATIVE_INFERENCE_REDIRECT : [])]
     : [...BASE_REDIRECT]
 }
 

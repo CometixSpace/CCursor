@@ -24,6 +24,7 @@ import type { ConnectRouter } from '@connectrpc/connect';
 import AiService from './core/AiService';
 import ChatService from './core/ChatService';
 import AgentService from './core/AgentService';
+import InferenceService from './core/InferenceService';
 import BackgroundComposerService from './core/BackgroundComposerService';
 import BidiService from './core/BidiService';
 import ReplayChatService from './core/ReplayChatService';
@@ -66,6 +67,7 @@ export default (router: ConnectRouter) => {
     AiService(router);
     ChatService(router);
     AgentService(router);
+    InferenceService(router);
     BackgroundComposerService(router);
     BidiService(router);
     ReplayChatService(router);

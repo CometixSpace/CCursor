@@ -51,6 +51,14 @@ export interface LLMUsage {
 
 /** 统一的 streaming 请求参数 */
 export interface LLMStreamRequest {
+  /** Transport cancellation, including native invocation cancellation. */
+  signal?: AbortSignal
+  /** Native Agent histories have already been normalized by Cursor. */
+  nativeInference?: boolean
+  temperature?: number
+  topP?: number
+  topK?: number
+  stopSequences?: string[]
   model: string
   messages: LLMMessage[]
   tools?: LLMTool[]

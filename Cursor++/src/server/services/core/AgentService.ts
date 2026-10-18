@@ -31,7 +31,8 @@ import { registerCloneLineage } from '../../handlers/agent/cloneRegistry'
 import { ModelNotFoundError } from '../../handlers/models/mapper'
 import { makeByokConnectError, makeModelNotFoundError, makeProviderError } from '../../handlers/errors'
 import { ErrorDetails_Error } from '../../gen/aiserver_v1_shared_pb'
-import { closeSession, createEphemeralSession, getOrCreateSession, markSessionClosed, pushSessionMessage, waitForMessage } from '../../handlers/agent/session'
+import { appendMessage, closeSession, createEphemeralSession, getOrCreateSession, markSessionClosed, pushSessionMessage, waitForMessage } from '../../handlers/agent/session'
+import { registerBidiReceiver } from '../../handlers/bidiMailbox'
 import { logger } from '../../logger'
 
 /**
@@ -160,6 +161,7 @@ export default (router: ConnectRouter) => {
 
       logger.info({ requestId }, '[SVC] AgentService/RunSSE started')
       const session = getOrCreateSession(requestId)
+      const releaseBidi = registerBidiReceiver(requestId, data => appendMessage(requestId, data))
 
       try {
         const firstMsg = await waitForMessage(session)
@@ -237,6 +239,7 @@ export default (router: ConnectRouter) => {
         throw connErr
       }
       finally {
+        releaseBidi()
         closeSession(requestId)
       }
     },

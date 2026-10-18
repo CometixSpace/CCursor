@@ -30,6 +30,7 @@ function withFallback(loaded: Partial<RoutesConfig> | null): RoutesConfig {
   return {
     $schemaVersion: loaded.$schemaVersion ?? fallback.$schemaVersion,
     byokMode,
+    ...(Array.isArray(loaded.nativeInferenceModels) ? { nativeInferenceModels: loaded.nativeInferenceModels.filter(id => typeof id === 'string') } : {}),
     server: {
       host: loaded.server?.host ?? fallback.server.host,
       port: loaded.server?.port ?? fallback.server.port,
@@ -40,7 +41,7 @@ function withFallback(loaded: Partial<RoutesConfig> | null): RoutesConfig {
     },
     redirect: Array.isArray(loaded.redirect) && loaded.redirect.length > 0
       ? loaded.redirect.slice()
-      : buildRedirectForMode(byokMode),
+      : buildRedirectForMode(byokMode, loaded.nativeInferenceModels),
   }
 }
 
@@ -118,7 +119,7 @@ export function getByokMode(): ByokMode {
 export function setByokMode(mode: ByokMode): Promise<RoutesConfig> {
   return updateRoutes((draft) => {
     draft.byokMode = mode
-    draft.redirect = buildRedirectForMode(mode)
+    draft.redirect = buildRedirectForMode(mode, draft.nativeInferenceModels)
     logger.info({ byokMode: mode, redirectCount: draft.redirect.length }, '[CFG] byokMode set')
   })
 }

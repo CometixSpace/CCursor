@@ -14,6 +14,7 @@ import { createBackup } from './backup.js';
 import { updateChecksums } from './checksum.js';
 import { hasActivateWait, injectActivateWait } from './patch-always-local.js';
 import { buildNodeHttp11RouterPayload, isNodeHttp11RouterPatched } from './node-http11-router.js';
+import { enableNativeInference, NATIVE_LOOP_MARKER } from './native-loop-guard.js';
 import {
   AGENT_WS_GATE_MARKER,
   AGENT_WS_ORIGINS_MARKER,
@@ -127,6 +128,9 @@ function prepareAgentHostPatch(paths, log) {
   const waited = injectActivateWait(entry, 'agent-host', log);
   if (!waited.ok) throw new Error('cursor-agent-host activate function not found');
   entry = waited.source;
+  if (entry.includes('byok-connect-routed') && entry.includes('agent_host_local_loop')) {
+    entry = enableNativeInference(entry).source;
+  }
   patchedByFile.set(paths.agentHostMain, entry);
 
   let websocketTargets = 0;
@@ -200,6 +204,8 @@ export function inspectAgentHostPatch(paths) {
   if (!entryValid) errors.push('entry fingerprint mismatch');
   const router = Boolean(entry) && isNodeHttp11RouterPatched(entry, AGENT_HOST_ROUTER_MARKER);
   const wait = Boolean(entry) && hasActivateWait(entry);
+  const nativeLoopRequired = entry.includes('byok-connect-routed') && entry.includes('agent_host_local_loop');
+  const nativeLoop = !nativeLoopRequired || entry.includes(`/*${NATIVE_LOOP_MARKER}*/`);
 
   let networkTargets = [];
   try { networkTargets = findAgentHostNetworkTargets(paths); }
@@ -221,7 +227,7 @@ export function inspectAgentHostPatch(paths) {
     }
   }
 
-  const fullyPatched = packageValid && entryValid && router && wait
+  const fullyPatched = packageValid && entryValid && router && wait && nativeLoop
     && networkTargets.length > 0 && websocketDisabled && errors.length === 0;
   return {
     present: true,
@@ -230,6 +236,7 @@ export function inspectAgentHostPatch(paths) {
     entryValid,
     router,
     wait,
+    nativeLoop,
     networkTargets,
     websocketTargets,
     websocketDisabled,

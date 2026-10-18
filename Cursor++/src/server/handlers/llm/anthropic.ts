@@ -70,7 +70,7 @@ export class AnthropicProvider implements LLMProvider {
 
     async *stream(request: LLMStreamRequest): AsyncIterable<LLMStreamEvent> {
         const diagnostics = createTransformDiagnostics('anthropic', request.messages.length);
-        const transformed = transformMessages(request.messages, 'anthropic', diagnostics, request.model);
+        const transformed = request.nativeInference ? request.messages : transformMessages(request.messages, 'anthropic', diagnostics, request.model);
         if (hasTransformMutations(diagnostics)) {
             logger.debug({
                 provider: 'anthropic',
@@ -80,13 +80,17 @@ export class AnthropicProvider implements LLMProvider {
         }
         const encoded = encodeAnthropicRequestMessages(transformed);
         const cached = applyAnthropicCacheBreakpoints(encoded.system, encoded.messages);
-        assertValidAnthropicToolUseContract(cached.messages);
+        if (!request.nativeInference) assertValidAnthropicToolUseContract(cached.messages);
 
         const params: Anthropic.MessageCreateParamsStreaming = {
             model: request.model,
             max_tokens: request.maxTokens ?? 8192,
             messages: cached.messages,
             stream: true,
+            ...(request.temperature !== undefined ? { temperature: request.temperature } : {}),
+            ...(request.topP !== undefined ? { top_p: request.topP } : {}),
+            ...(request.topK !== undefined ? { top_k: request.topK } : {}),
+            ...(request.stopSequences?.length ? { stop_sequences: request.stopSequences } : {}),
         };
 
         if (cached.system) {
@@ -134,8 +138,8 @@ export class AnthropicProvider implements LLMProvider {
             betas.push(...request.anthropicBetas.filter(b => !betas.includes(b)));
 
         const stream = betas.length > 0
-            ? this.client.beta.messages.stream({ ...params, betas } as any)
-            : this.client.messages.stream(params);
+            ? this.client.beta.messages.stream({ ...params, betas } as any, { signal: request.signal })
+            : this.client.messages.stream(params, { signal: request.signal });
         const contentBlocks = new Map<number, { type: string; id?: string; name?: string; signature?: string }>();
 
         for await (const event of stream) {
