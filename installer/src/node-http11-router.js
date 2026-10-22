@@ -13,8 +13,8 @@ import {
   ROUTES_FILE_NAME,
 } from './defaults.js';
 
-export const HTTP11_ROUTER_VERSION_MARKER = '__byokHttp11RouterV2';
-export const HTTP11_ROUTER_SOURCE_MARKER = 'BYOK-HTTP11-ROUTER-V2';
+export const HTTP11_ROUTER_VERSION_MARKER = '__byokHttp11RouterV3';
+export const HTTP11_ROUTER_SOURCE_MARKER = 'BYOK-HTTP11-ROUTER-V3';
 
 /**
  * @param {{ guardMarker: string, processLabel: string }} options
@@ -39,6 +39,10 @@ export function buildNodeHttp11RouterPayload({ guardMarker, processLabel }) {
   var _directHttpOwner=_http.__vscodeOriginal||_http;
   var _directHttpRequest=(_http.__vscodeOriginal&&_http.__vscodeOriginal.request)||_proxyHttpRequest;
   var ROUTES_PATH=_path.join(_os.homedir(),${ccursorDir},${routesFile});
+  var LOG_DIR=_path.join(_os.homedir(),${ccursorDir},"logs");
+  var LOG_PATH=_path.join(LOG_DIR,"router-"+PROCESS_LABEL+"-"+process.pid+".log");
+  function routerLog(event,extra){try{_fs.mkdirSync(LOG_DIR,{recursive:true});_fs.appendFileSync(LOG_PATH,new Date().toISOString()+" ["+PROCESS_LABEL+"] "+event+(extra?" "+JSON.stringify(extra):"")+"\\n");}catch(e){}}
+  routerLog("payload loaded",{pid:process.pid,argv:process.argv.slice(0,2).join(" "),title:String(process.env.VSCODE_PROCESS_TITLE||"")});
   var FALLBACK_HOST=${fallbackHost},FALLBACK_PORT=${fallbackPort};
   var _title=String(process.env.VSCODE_PROCESS_TITLE||""),_widMatch=_title.match(/\\[(\\d+)-\\d+\\]/),WINDOW_ID=_widMatch?_widMatch[1]:null;
   var state={host:FALLBACK_HOST,port:FALLBACK_PORT,base:"http://"+FALLBACK_HOST+":"+FALLBACK_PORT,svcSet:new Set(),methodSet:new Set(),restSet:new Set(),ruleCount:0,restCount:0};
@@ -80,9 +84,13 @@ export function buildNodeHttp11RouterPayload({ guardMarker, processLabel }) {
   function rewriteOptions(options){var result=localOptions(options);result.protocol="http:";result.hostname=state.host;result.port=state.port;return result;}
   function rewriteUrl(parsed){var path=parsed.path||"/";return state.base+(path.charAt(0)==="/"?path:"/"+path);}
   function directRequest(parsed,second,callback){var cb=typeof second==="function"?second:callback;if(parsed.kind==="object")return _directHttpRequest.call(_directHttpOwner,rewriteOptions(parsed.raw),cb);var options=typeof second==="function"||second==null?{}:second;return _directHttpRequest.call(_directHttpOwner,rewriteUrl(parsed),localOptions(options),cb);}
-  function interceptRequest(isHttps){return function(input,options,callback){var parsed=parseRequest(input);if(parsed&&((isCursorApiHost(parsed.hostname)&&shouldRedirect(parsed.path))||isConfiguredLocal(parsed)))return directRequest(parsed,options,callback);var original=isHttps?_proxyHttpsRequest:_proxyHttpRequest;return original.call(isHttps?_https:_http,input,options,callback);};}
+  function interceptRequest(isHttps){return function(input,options,callback){var parsed=parseRequest(input);if(!parsed)routerLog("unparsed-request",{https:!!isHttps,inputType:typeof input});else if(isCursorApiHost(parsed.hostname))routerLog("request",{https:!!isHttps,host:parsed.hostname,path:parsed.path,kind:parsed.kind,redirect:shouldRedirect(parsed.path)});if(parsed&&((isCursorApiHost(parsed.hostname)&&shouldRedirect(parsed.path))||isConfiguredLocal(parsed)))return directRequest(parsed,options,callback);var original=isHttps?_proxyHttpsRequest:_proxyHttpRequest;return original.call(isHttps?_https:_http,input,options,callback);};}
   function interceptGet(isHttps){return function(input,options,callback){var parsed=parseRequest(input);if(parsed&&((isCursorApiHost(parsed.hostname)&&shouldRedirect(parsed.path))||isConfiguredLocal(parsed))){var request=(isHttps?_https:_http).request(input,options,callback);request.end();return request;}var original=isHttps?_proxyHttpsGet:_proxyHttpGet;return original.call(isHttps?_https:_http,input,options,callback);};}
   _http.request=interceptRequest(false);_https.request=interceptRequest(true);_http.get=interceptGet(false);_https.get=interceptGet(true);
+  // Defensive re-assert on the shared builtin module objects once the current
+  // bundle has populated its exports: consumers may resolve require("http"/"https")
+  // lazily, and this keeps both the wrapper and the raw module objects consistent.
+  setTimeout(function(){try{var legacyHttp=require("http"),legacyHttps=require("https");if(legacyHttps&&typeof legacyHttps.request==="function"){legacyHttps.request=_https.request;legacyHttps.get=_https.get;}if(legacyHttp&&typeof legacyHttp.request==="function"){legacyHttp.request=_http.request;legacyHttp.get=_http.get;}routerLog("legacy rebind complete");}catch(e){routerLog("legacy rebind failed",{error:e.message});}},0);
   try{if(typeof _module.syncBuiltinESMExports==="function")_module.syncBuiltinESMExports();}catch(e){console.warn("[BYOK] "+PROCESS_LABEL+" syncBuiltinESMExports failed: "+e.message);}
   console.log("[BYOK] "+PROCESS_LABEL+" HTTP/1.1 whitelist router active (config: "+ROUTES_PATH+")");
 })();
@@ -97,5 +105,6 @@ export function isNodeHttp11RouterPatched(source, guardMarker) {
     && head.includes(guardMarker)
     && head.includes('_http.request=interceptRequest(false)')
     && head.includes('_https.request=interceptRequest(true)')
+    && head.includes('legacyHttps.request=_https.request')
     && head.includes('_module.syncBuiltinESMExports');
 }

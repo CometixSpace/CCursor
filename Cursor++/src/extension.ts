@@ -5,7 +5,7 @@ import { bumpRefreshSignal, pushRoutesUpdate, startServer, stopServer } from './
 import { getServerConfig } from './server/config'
 import { getLogsDir, getProvidersFilePath, getSessionLogFilePath } from './server/config/paths'
 import { ensureProvidersFile, onProvidersChange, startProvidersWatcher, stopProvidersWatcher } from './server/config/providersStore'
-import { ensureRoutesFile, onRoutesChange, startRoutesWatcher, stopRoutesWatcher, toggleByokMode } from './server/config/routesStore'
+import { ensureRoutesFile, getByokMode, onRoutesChange, startRoutesWatcher, stopRoutesWatcher, toggleByokMode } from './server/config/routesStore'
 import { isLikelyWindowsMsvcMissing, preflightSupermarkdown, setSupermarkdownNativeErrorNotifier } from './server/handlers/agent/supermarkdown'
 import { resetProviderInstanceCache } from './server/handlers/llm/providerRuntime'
 import { initLogger } from './server/logger'
@@ -366,6 +366,36 @@ function renderStatusBar() {
 
 // ── Server 操作 ──
 
+/**
+ * 关闭 Cursor 3.26 的 "启动期 Connect 快速通道"
+ *
+ * `workbench.contrib.startupConnectTransport` (cursorStartupHttp) 会把
+ * aiserver.v1.AiService/AvailableModels 之类的调用交给 **主进程** 的 fetch
+ * 直接发往 https://api2.cursor.sh —— 它不经过扩展宿主, 因此完全绕过 BYOK 的
+ * HTTP/1.1 白名单路由。BYOK 开着时, 官方返回的模型列表会在启动后/刷新后
+ * 几十毫秒到几秒把本地的 BYOK 列表覆盖掉 (`availableDefaultModels2` 是跨窗口共享的)。
+ *
+ * 这个通道只是启动期渲染优化, 关掉之后同样的请求会走扩展宿主的 ConnectRPC,
+ * 被路由拦到本地服务。只在 BYOK 开启时关闭, OFF 模式保持 Cursor 原行为。
+ */
+async function disableStartupConnectTransport(): Promise<void> {
+  if (getByokMode() !== 1)
+    return
+
+  const settingKey = 'cursor.experimental.startupConnectTransport'
+  const configuration = vscode.workspace.getConfiguration()
+  if (configuration.get<boolean>(settingKey) === false)
+    return
+
+  try {
+    await configuration.update(settingKey, false, vscode.ConfigurationTarget.Global)
+    log('info', `[CFG] disabled ${settingKey} — BYOK requires every Cursor API call to reach the local router`)
+  }
+  catch (err) {
+    log('warn', `[CFG] could not disable ${settingKey}: ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
 async function toggleServer() {
   const s = getState()
 
@@ -480,6 +510,9 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('cursor2plus.toggleByok', async () => {
       const next = await toggleByokMode()
       await refreshState()
+      // 开启 BYOK 时同步关掉主进程的启动期 fetch 通道 (见 disableStartupConnectTransport)
+      if (next.byokMode)
+        await disableStartupConnectTransport()
       // 1. 推送 REST redirect 列表变更到 renderer — inject-patch 的 fetch wrapper
       //    安装时写死了 _restPaths, 切 OFF 后 /auth/poll 仍被拦截导致登录中断,
       //    必须通过 SSE 推送新列表让 renderer 热更新。
@@ -508,6 +541,9 @@ export async function activate(context: vscode.ExtensionContext) {
   // 确保配置文件存在 —— 即使 server 未启动,面板也能读写
   await ensureRoutesFile()
   await ensureProvidersFile()
+
+  // BYOK 开启时必须关掉主进程的启动期 fetch 通道,否则官方模型列表会绕过本地路由
+  await disableStartupConnectTransport()
 
   // 文件监听: 其他实例修改配置时自动同步状态 + UI
   startRoutesWatcher()

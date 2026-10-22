@@ -54,7 +54,8 @@ export async function install() {
   const proxy39Ok = !needsProxy39Patch(paths) || isProxy39Patched(paths);
   const agentHostBackups = getAgentHostBackupTargets(paths).some(file => hasBackup(file, 'agent-host'));
   const hasBackups = hasBackup(paths.workbenchJs) || hasBackup(paths.glassJs) || hasBackup(paths.alwaysLocalMain)
-    || hasBackup(paths.alwaysLocalSingletonJs) || hasBackup(paths.extensionHostJs) || agentHostBackups;
+    || hasBackup(paths.alwaysLocalSingletonJs) || hasBackup(paths.extensionHostJs)
+    || agentHostBackups;
 
   if (extInstalled && hookInjected && alPatched && agentHostPatched && proxy39Ok) {
     ok('Already fully installed');

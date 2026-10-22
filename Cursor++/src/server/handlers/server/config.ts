@@ -18,11 +18,19 @@
  */
 
 import { config } from '../../runtime-config';
+import { Http2Config } from '../../gen/aiserver_v1_pb';
 
 export function buildServerConfig() {
     const byokUrl = `http://${config.server.host}:${config.server.port}`;
 
     return {
+        // BYOK 的路由是 HTTP/1.1 白名单拦截 (http/https.request monkey patch)。
+        // 3.26 的 Agent Host 在 http2Config=UNSPECIFIED 时会为部分 RPC 建 HTTP/2
+        // transport (baseUrl api2/agentn)，完全绕过拦截，RunSSE 直达官方并被判
+        // "Unknown model ID"。这里显式要求全量 HTTP/1.1，让所有 Cursor API 请求
+        // 都经过本地路由。
+        http2Config: Http2Config.FORCE_ALL_DISABLED,
+
         bugConfigResponse: {
             bugBotV1: { backgroundCallFrequencyMs: 3600000 },
         },
