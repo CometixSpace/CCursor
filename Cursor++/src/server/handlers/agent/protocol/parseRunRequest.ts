@@ -1,5 +1,6 @@
 import type { IdeFile, ParsedCursorRule, ParsedRunRequest } from './types'
 import { listKnowledgeItems } from '../../../config/knowledgeBaseStore'
+import { resolveRequestedModelId } from '../../models/requestedModelId'
 import { logger } from '../../../logger'
 import { emptyParsed, toBytes } from './shared'
 import {
@@ -747,13 +748,22 @@ export function parseRunRequest(msg: Record<string, unknown>): ParsedRunRequest 
     logger.debug({ parameters: Object.fromEntries(paramMap) }, '[AGENT] client parameters')
   }
 
+  // 客户端可能只给占位名 ("default" / "auto" / 空) —— 例如 Auto 视图下的旧会话,
+  // 或 Agent Window 新建会话还没落成具体 id。BYOK 没有服务端路由层,
+  // 必须在这里换成 providers.json 里真实登记的模型, 否则 RunSSE 会直接报模型未找到。
+  const requestedModelId = (requestedModel?.modelId as string) || (modelDetails?.modelId as string) || ''
+  const effectiveModelId = resolveRequestedModelId(requestedModelId)
+  if (effectiveModelId !== requestedModelId) {
+    logger.info({ requestedModelId, effectiveModelId }, '[AGENT] default model alias mapped to configured BYOK model')
+  }
+
   return {
     userText: isExecutePlan && planContent
       ? `Execute the following plan:\n\n${planContent}`
       : isBackgroundTaskCompletion
         ? backgroundTaskCompletionText
         : baseUserText,
-    modelId: (requestedModel?.modelId as string) || (modelDetails?.modelId as string) || '',
+    modelId: effectiveModelId,
     conversationId: (runRequest.conversationId as string) ?? '',
     requestContextTransport: requestContextParts
       ? (inlineRequestContext ? 'dual' : 'ref_only')
