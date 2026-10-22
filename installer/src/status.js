@@ -73,6 +73,17 @@ export async function status() {
   else {
     console.log(agentHost.router ? ok('Agent Host HTTP/1.1 router active') : fail('Agent Host HTTP/1.1 router missing'));
     console.log(agentHost.wait ? ok('Agent Host server wait active') : fail('Agent Host server wait missing'));
+    if (agentHost.turnRouteRequired) {
+      console.log(agentHost.turnRoute
+        ? ok('Agent Host turn router pinned to connect (3.19.19+ BYOK)')
+        : fail('Agent Host turn router still routes to managed-local (3.19.19+ BYOK unreachable)'));
+    }
+    else if (agentHost.entryValid) {
+      console.log(na('Agent Host local-loop turn router not present (pre-3.19.19 or non-entry chunk)'));
+    }
+    else {
+      console.log(fail('Agent Host turn router state unknown (entry unreadable)'));
+    }
     console.log(agentHost.networkTargets.length > 0
       ? ok(`Agent Host network target verified (${agentHost.networkTargets.map(file => file.split(/[\\/]/).pop()).join(', ')})`)
       : fail('Agent Host network target not found'));
