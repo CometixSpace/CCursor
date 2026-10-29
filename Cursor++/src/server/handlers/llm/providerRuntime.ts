@@ -21,6 +21,7 @@ import {
 import type { SemanticTurn } from './semanticConversation';
 import { llmMessageToStoredMessage } from './storedTranscript';
 import { filterToolsForMode } from '../agent/toolkit/types';
+import { instrumentProviderEntry } from '../../usage/instrument';
 
 export interface PreparedProviderConversation {
     normalizedMessages: LLMMessage[];
@@ -87,7 +88,7 @@ function instantiateProvider(entry: ProviderEntry): LLMProvider {
 function getProviderForEntry(entry: ProviderEntry): LLMProvider {
     let inst = providerInstances.get(entry.id);
     if (!inst) {
-        inst = instantiateProvider(entry);
+        inst = instrumentProviderEntry(instantiateProvider(entry), entry);
         providerInstances.set(entry.id, inst);
     }
     return inst;

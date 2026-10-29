@@ -295,6 +295,59 @@ export function ModelCard() {
           </div>
         </div>
 
+        <div class="field-row">
+          <div class="field">
+            <label>Input / 1M</label>
+            <input
+              type="text"
+              x-effect="if(document.activeElement !== $el) $el.value = m.inputCostPerMillion ?? ''"
+              x-on:input="$store.app.updateModelField(p.id, m.id, 'inputCostPerMillion', $event.target.value || undefined)"
+              placeholder="0"
+              title="Price per million input tokens in the selected currency"
+            />
+          </div>
+          <div class="field">
+            <label>Output / 1M</label>
+            <input
+              type="text"
+              x-effect="if(document.activeElement !== $el) $el.value = m.outputCostPerMillion ?? ''"
+              x-on:input="$store.app.updateModelField(p.id, m.id, 'outputCostPerMillion', $event.target.value || undefined)"
+              placeholder="0"
+              title="Price per million output tokens in the selected currency"
+            />
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>Cache read / 1M</label>
+            <input
+              type="text"
+              x-effect="if(document.activeElement !== $el) $el.value = m.cacheReadCostPerMillion ?? ''"
+              x-on:input="$store.app.updateModelField(p.id, m.id, 'cacheReadCostPerMillion', $event.target.value || undefined)"
+              placeholder="0"
+            />
+          </div>
+          <div class="field">
+            <label>Cache write / 1M</label>
+            <input
+              type="text"
+              x-effect="if(document.activeElement !== $el) $el.value = m.cacheCreationCostPerMillion ?? ''"
+              x-on:input="$store.app.updateModelField(p.id, m.id, 'cacheCreationCostPerMillion', $event.target.value || undefined)"
+              placeholder="0"
+            />
+          </div>
+        </div>
+        <div class="field">
+          <label>Cost multiplier</label>
+          <input
+            type="text"
+            x-effect="if(document.activeElement !== $el) $el.value = m.costMultiplier ?? ''"
+            x-on:input="$store.app.updateModelField(p.id, m.id, 'costMultiplier', $event.target.value || undefined)"
+            placeholder="1"
+            title="Applied after the four token buckets, e.g. 1.1 for a 10% markup"
+          />
+        </div>
+
         {/* Tooltip */}
         <div class="field">
           <label>Tooltip Markdown (hover in model picker)</label>

@@ -89,6 +89,7 @@ export class GeminiProvider implements LLMProvider {
 
         let inputTokens = 0;
         let outputTokens = 0;
+        let cacheReadTokens = 0;
         let sawToolCalls = false;
         let syntheticToolCallCounter = 0;
         let wasThinking = false;
@@ -99,7 +100,9 @@ export class GeminiProvider implements LLMProvider {
         for await (const chunk of response) {
             if (chunk.usageMetadata) {
                 inputTokens = chunk.usageMetadata.promptTokenCount ?? 0;
-                outputTokens = chunk.usageMetadata.candidatesTokenCount ?? 0;
+                outputTokens = (chunk.usageMetadata.candidatesTokenCount ?? 0)
+                    + (chunk.usageMetadata.thoughtsTokenCount ?? 0);
+                cacheReadTokens = chunk.usageMetadata.cachedContentTokenCount ?? 0;
             }
 
             const parts = chunk.candidates?.[0]?.content?.parts;
@@ -141,7 +144,7 @@ export class GeminiProvider implements LLMProvider {
         yield {
             type: 'done',
             stopReason: sawToolCalls ? 'tool_use' : 'end_turn',
-            usage: { inputTokens, outputTokens },
+            usage: { inputTokens, outputTokens, cacheReadTokens },
         };
     }
 }

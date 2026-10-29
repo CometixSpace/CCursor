@@ -11,8 +11,11 @@ import { isLikelyWindowsMsvcMissing, preflightSupermarkdown, setSupermarkdownNat
 import { resetProviderInstanceCache } from './server/handlers/llm/providerRuntime'
 import { initLogger } from './server/logger'
 import { getRoutesFilePath } from './server/routes'
+import { ensureUsageSettingsFile, onUsageSettingsChange, startUsageSettingsWatcher, stopUsageSettingsWatcher } from './server/usage/settings'
+import { pruneOldUsageLogs } from './server/usage/store'
 import { PanelProvider } from './ui/panel-provider'
 import { getState, onStateChange, probeByokServer, refreshState, setFileLogState } from './ui/state'
+import { getUsageSuffix, getUsageTooltipLine, initUsageStatusBar, refreshUsageStatusBar } from './ui/usage-statusbar'
 import { startUpdateCheck, stopUpdateCheck } from './update-check'
 
 let outputChannel: vscode.LogOutputChannel
@@ -357,8 +360,8 @@ function renderStatusBar() {
     ? 'BYOK ON — using local providers.json'
     : 'BYOK OFF — passing through to official Cursor'
 
-  statusBarItem.text = `${serverIcon} BYOK ${byokGlyph}`
-  statusBarItem.tooltip = `${serverTip}\n${byokTip}\n\nClick: toggle BYOK Mode`
+  statusBarItem.text = `${serverIcon} BYOK ${byokGlyph}${getUsageSuffix()}`
+  statusBarItem.tooltip = `${serverTip}\n${byokTip}${getUsageTooltipLine() ? `\n${getUsageTooltipLine()}` : ''}\n\nClick: toggle BYOK Mode`
   statusBarItem.backgroundColor = s.byokMode
     ? undefined
     : new vscode.ThemeColor('statusBarItem.warningBackground')
@@ -499,12 +502,20 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // 状态栏 (BYOK Mode 切换按钮)
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100)
+  statusBarItem.name = 'Cursor++: BYOK'
   statusBarItem.command = 'cursor2plus.toggleByok'
   statusBarItem.show()
   context.subscriptions.push(statusBarItem)
 
-  // 状态变化 → 刷新状态栏
-  context.subscriptions.push(onStateChange(() => renderStatusBar()))
+  // 用量后缀挂在 BYOK 状态栏项上 (今日费用, 点击项仍是 BYOK 开关)
+  initUsageStatusBar(renderStatusBar)
+
+  // 状态变化 → 刷新状态栏; server 就绪时同步刷新今日费用后缀
+  context.subscriptions.push(onStateChange(() => {
+    renderStatusBar()
+    if (getState().server === 'local')
+      refreshUsageStatusBar()
+  }))
 
   // 侧边栏面板
   const panelProvider = new PanelProvider(context)
@@ -532,6 +543,10 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('cursor2plus.openSettings', () => {
       vscode.commands.executeCommand('cursor2plus.panel.focus')
     }),
+    vscode.commands.registerCommand('cursor2plus.openUsage', () => {
+      void vscode.commands.executeCommand('cursor2plus.panel.focus')
+      panelProvider.revealUsage()
+    }),
     vscode.commands.registerCommand('cursor2plus.toggleFileLog', () => toggleFileLog(context)),
     vscode.commands.registerCommand('cursor2plus.openLogFile', () => openLogFile()),
   )
@@ -539,10 +554,14 @@ export async function activate(context: vscode.ExtensionContext) {
   // 确保配置文件存在 —— 即使 server 未启动,面板也能读写
   await ensureRoutesFile()
   await ensureProvidersFile()
+  ensureUsageSettingsFile()
+  // 清理超过保留期的用量明细, 防止 usage_logs 无限膨胀
+  void pruneOldUsageLogs()
 
   // 文件监听: 其他实例修改配置时自动同步状态 + UI
   startRoutesWatcher()
   startProvidersWatcher()
+  startUsageSettingsWatcher()
   const disposeRoutesWatch = onRoutesChange(async () => {
     await refreshState()
     renderStatusBar()
@@ -556,7 +575,11 @@ export async function activate(context: vscode.ExtensionContext) {
     await refreshState()
     bumpRefreshSignal()
   })
-  context.subscriptions.push({ dispose: disposeRoutesWatch }, { dispose: disposeProvidersWatch })
+  const disposeUsageWatch = onUsageSettingsChange(async () => {
+    await refreshState()
+    refreshUsageStatusBar()
+  })
+  context.subscriptions.push({ dispose: disposeRoutesWatch }, { dispose: disposeProvidersWatch }, { dispose: disposeUsageWatch })
 
   // 初始化状态
   await refreshState()
@@ -602,6 +625,7 @@ export async function deactivate() {
   closeLogFileStream()
   stopRoutesWatcher()
   stopProvidersWatcher()
+  stopUsageSettingsWatcher()
   await stopServer()
   if (outputChannel)
     outputChannel.dispose()

@@ -4,6 +4,15 @@ All notable changes to the Cursor++ BYOK extension are documented here.
 
 Format follows [Keep a Changelog](http://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+
+- BYOK usage dashboard: four-bucket token accounting, per-model prices, CNY/USD display,
+  and provider/model filters in the Cursor++ sidebar. Tool rounds and auto-summarize are recorded.
+  Unchecking every provider shows zero instead of falling back to all; rechecking a provider
+  includes all of its models. Costs use live model prices, not the cached provider snapshot.
+
 ## [0.0.7]
 
 ### Added

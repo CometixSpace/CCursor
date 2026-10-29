@@ -39,6 +39,10 @@
         "title": "Cursor++: Open Settings"
       },
       {
+        "command": "cursor2plus.openUsage",
+        "title": "Cursor++: Open Usage Panel"
+      },
+      {
         "command": "cursor2plus.toggleFileLog",
         "title": "Cursor++: Toggle File Logging (debug)"
       },

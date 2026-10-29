@@ -19,6 +19,7 @@ import { bumpRefreshSignal } from '../server'
 import { searchCatalog } from '../server/config/catalogStore'
 import { updateProviders } from '../server/config/providersStore'
 import { resetProviderInstanceCache } from '../server/handlers/llm/providerRuntime'
+import { onUsageRecorded } from '../server/usage/events'
 import { renderHtml } from './components/layout'
 import { getState, onStateChange, refreshState } from './state'
 
@@ -40,6 +41,7 @@ export class PanelProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView
   private context: vscode.ExtensionContext
   private disposeStateListener?: vscode.Disposable
+  private disposeUsageListener?: () => void
 
   constructor(context: vscode.ExtensionContext) {
     this.context = context
@@ -161,6 +163,34 @@ export class PanelProvider implements vscode.WebviewViewProvider {
           }
           break
         }
+        case 'loadUsage':
+          await this.postUsage()
+          break
+        case 'saveUsageSettings': {
+          try {
+            const { updateUsageSettings } = await import('../server/usage/settings')
+            await updateUsageSettings((draft) => {
+              if (msg.currency === 'USD' || msg.currency === 'CNY')
+                draft.currency = msg.currency
+              if (msg.range === 'today' || msg.range === '7d' || msg.range === '14d' || msg.range === '30d' || msg.range === 'month')
+                draft.range = msg.range
+              if (msg.statusBarScope === 'today' || msg.statusBarScope === 'month')
+                draft.statusBarScope = msg.statusBarScope
+              if (typeof msg.filterCustomized === 'boolean')
+                draft.filterCustomized = msg.filterCustomized
+              if (Array.isArray(msg.selectedProviderIds))
+                draft.selectedProviderIds = msg.selectedProviderIds
+              if (Array.isArray(msg.selectedModelKeys))
+                draft.selectedModelKeys = msg.selectedModelKeys
+            })
+            await this.postUsage()
+          }
+          catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            this.view?.webview.postMessage({ type: 'toast', text: `Save usage settings failed: ${errMsg}`, level: 'error', duration: 6000 })
+          }
+          break
+        }
         case 'saveWebTools': {
           try {
             const { updateWebTools } = await import('../server/config/searchConfigStore')
@@ -223,11 +253,25 @@ export class PanelProvider implements vscode.WebviewViewProvider {
 
     this.disposeStateListener?.dispose()
     this.disposeStateListener = onStateChange(() => this.postState())
+    this.disposeUsageListener?.()
+    this.disposeUsageListener = onUsageRecorded(() => {
+      void this.postUsage()
+    })
     webviewView.onDidDispose(() => {
       this.disposeStateListener?.dispose()
       this.disposeStateListener = undefined
+      this.disposeUsageListener?.()
+      this.disposeUsageListener = undefined
       this.view = undefined
     })
+  }
+
+  private revealNext = false
+
+  /** Status-bar entry point: refresh usage and ask the webview to expand the panel. */
+  revealUsage() {
+    this.revealNext = true
+    void this.postUsage()
   }
 
   private postState() {
@@ -235,5 +279,42 @@ export class PanelProvider implements vscode.WebviewViewProvider {
       return
     const s = getState()
     this.view.webview.postMessage({ type: 'state', state: s })
+    void this.postUsage()
+  }
+
+  private async postUsage() {
+    if (!this.view)
+      return
+    const reveal = this.revealNext
+    this.revealNext = false
+    try {
+      const { isAgentDatabaseReady } = await import('../server/database/sqlite')
+      const { loadUsageSettings } = await import('../server/usage/settings')
+      const { formatCost } = await import('../server/usage/calculator')
+      const { queryUsageDashboard, serializeUsageDashboard } = await import('../server/usage/store')
+      if (!isAgentDatabaseReady()) {
+        const settings = loadUsageSettings()
+        const zeroCost = formatCost(0n, settings.currency)
+        this.view.webview.postMessage({
+          type: 'usage',
+          reveal,
+          usage: {
+            settings,
+            todayCostFormatted: zeroCost,
+            summary: { requestCount: 0, realTotalTokens: 0, cacheHitRate: 0, unpricedCount: 0, totalCostFormatted: zeroCost },
+            providers: [],
+            models: [],
+            recent: [],
+          },
+        })
+        return
+      }
+      const dashboard = await queryUsageDashboard(loadUsageSettings())
+      this.view.webview.postMessage({ type: 'usage', reveal, usage: serializeUsageDashboard(dashboard) })
+    }
+    catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err)
+      this.view.webview.postMessage({ type: 'toast', text: `Load usage failed: ${errMsg}`, level: 'error', duration: 4000 })
+    }
   }
 }

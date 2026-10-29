@@ -85,6 +85,14 @@ export function initApp(Alpine: AlpineType) {
     webToolsOpen: false,
     webToolsTab: 'search' as 'search' | 'fetch',
     webTools: null as any,
+    usage: null as any,
+    usageOpen: false,
+    usageRange: 'today',
+    usageCurrency: 'CNY',
+    usageProviderExpanded: {} as Record<string, boolean>,
+    usageShowAllProviders: false,
+    usageRecentLimit: 3,
+    usageRecentExpanded: {} as Record<string, boolean>,
 
     isSearchProviderEnabled(type: string): boolean {
       return this.webTools?.search?.providers?.find((p: any) => p.type === type)?.enabled ?? false
@@ -165,6 +173,195 @@ export function initApp(Alpine: AlpineType) {
           out.push(draft)
       }
       return out
+    },
+
+    get cacheHitLabel(): string {
+      const rate = this.usage?.summary?.cacheHitRate
+      if (typeof rate !== 'number')
+        return '—'
+      return `${Math.round(rate * 1000) / 10}%`
+    },
+
+    loadUsage() {
+      this.post('loadUsage')
+    },
+
+    toggleUsageOpen() {
+      this.usageOpen = !this.usageOpen
+      if (this.usageOpen)
+        this.loadUsage()
+    },
+
+    saveUsageSettings(options?: { customizeFilter?: boolean }) {
+      const selectedProviderIds = (this.usage?.providers || []).filter((p: any) => p.selected).map((p: any) => p.id)
+      const selectedModelKeys = (this.usage?.models || []).filter((m: any) => m.selected).map((m: any) => m.key)
+      this.post('saveUsageSettings', {
+        currency: this.usageCurrency,
+        range: this.usageRange,
+        statusBarScope: this.usage?.settings?.statusBarScope === 'today' ? 'today' : 'month',
+        filterCustomized: options?.customizeFilter ? true : this.usage?.settings?.filterCustomized,
+        selectedProviderIds,
+        selectedModelKeys,
+      })
+    },
+
+    toggleUsageBarScope() {
+      const current = this.usage?.settings?.statusBarScope === 'today' ? 'today' : 'month'
+      const next = current === 'month' ? 'today' : 'month'
+      if (this.usage?.settings)
+        this.usage.settings.statusBarScope = next
+      this.post('saveUsageSettings', {
+        currency: this.usageCurrency,
+        range: this.usageRange,
+        statusBarScope: next,
+        filterCustomized: this.usage?.settings?.filterCustomized,
+        selectedProviderIds: (this.usage?.providers || []).filter((p: any) => p.selected).map((p: any) => p.id),
+        selectedModelKeys: (this.usage?.models || []).filter((m: any) => m.selected).map((m: any) => m.key),
+      })
+    },
+
+    get usageBarScopeLabel(): string {
+      return this.usage?.settings?.statusBarScope === 'today' ? 'Bar: Today' : 'Bar: Month'
+    },
+
+    toggleUsageProvider(id: string, checked: boolean) {
+      const provider = (this.usage?.providers || []).find((p: any) => p.id === id)
+      if (provider)
+        provider.selected = checked
+      for (const model of this.usage?.models || []) {
+        if (model.providerId === id)
+          model.selected = checked
+      }
+      this.saveUsageSettings({ customizeFilter: true })
+    },
+
+    toggleUsageModel(key: string, checked: boolean) {
+      const model = (this.usage?.models || []).find((m: any) => m.key === key)
+      if (model) {
+        model.selected = checked
+        if (checked) {
+          const provider = (this.usage?.providers || []).find((p: any) => p.id === model.providerId)
+          if (provider && !provider.selected)
+            provider.selected = true
+        }
+      }
+      this.saveUsageSettings({ customizeFilter: true })
+    },
+
+    toggleUsageProviderExpanded(id: string) {
+      this.usageProviderExpanded[id] = !this.usageProviderExpanded[id]
+    },
+
+    usageModelsFor(providerId: string): any[] {
+      return (this.usage?.models || []).filter((m: any) => m.providerId === providerId)
+    },
+
+    get usageProvidersVisible(): any[] {
+      const all = this.usage?.providers || []
+      if (this.usageShowAllProviders)
+        return all
+      return all.filter((p: any) => p.totalCostMicros !== '0')
+    },
+
+    get usageProvidersHiddenCount(): number {
+      return (this.usage?.providers || []).length - this.usageProvidersVisible.length
+    },
+
+    get usageHiddenProvidersLabel(): string {
+      if (this.usageShowAllProviders)
+        return 'Show fewer providers'
+      return `Show ${this.usageProvidersHiddenCount} providers with no usage`
+    },
+
+    get usageRecentToggleLabel(): string {
+      if (this.usageRecentLimit >= 30)
+        return 'Show less'
+      return `Show all (${this.usage?.recent?.length ?? 0})`
+    },
+
+    get usageRecentList(): any[] {
+      return (this.usage?.recent || []).slice(0, this.usageRecentLimit)
+    },
+
+    toggleUsageRecentExpanded(requestId: string) {
+      this.usageRecentExpanded[requestId] = !this.usageRecentExpanded[requestId]
+    },
+
+    get usageSuccessLabel(): string {
+      const summary = this.usage?.summary
+      if (!summary || !summary.requestCount)
+        return '—'
+      const percent = (summary.okCount / summary.requestCount) * 100
+      return `${Math.round(percent * 10) / 10}%`
+    },
+
+    get usageRangeLabel(): string {
+      const labels: Record<string, string> = {
+        'today': 'Today',
+        '7d': 'Last 7 days',
+        '14d': 'Last 14 days',
+        '30d': 'Last 30 days',
+      }
+      return labels[this.usageRange] || 'Today'
+    },
+
+    /** Per-day cost bars: precomputed heights + tooltip text for the template. */
+    get usageDailyBars(): any[] {
+      const daily = this.usage?.daily || []
+      let maxMicros = 0n
+      for (const day of daily) {
+        const cost = BigInt(day.totalCostMicros || '0')
+        if (cost > maxMicros)
+          maxMicros = cost
+      }
+      return daily.map((day: any) => {
+        const cost = BigInt(day.totalCostMicros || '0')
+        const heightPercent = maxMicros > 0n ? Number((cost * 100n) / maxMicros) : 0
+        return {
+          date: day.date,
+          heightPercent: Math.max(day.requestCount > 0 && heightPercent === 0 ? 4 : heightPercent, 0),
+          title: `${day.date} · ${day.requestCount} req · ${this.formatUsageCost(day.totalCostFormatted)}`,
+        }
+      })
+    },
+
+    get usageTrendStartLabel(): string {
+      return (this.usage?.daily || [])[0]?.date || ''
+    },
+
+    get usageTrendEndLabel(): string {
+      const daily = this.usage?.daily || []
+      return daily.length ? daily[daily.length - 1].date : ''
+    },
+
+    formatUsageDuration(durationMs: number): string {
+      if (!durationMs)
+        return '—'
+      if (durationMs < 1000)
+        return `${durationMs}ms`
+      return `${Math.round(durationMs / 100) / 10}s`
+    },
+
+    formatUsageTokens(count: number): string {
+      if (count >= 1_000_000)
+        return `${Math.round((count / 1_000_000) * 10) / 10}M`
+      if (count >= 1000)
+        return `${Math.round(count / 100) / 10}k`
+      return String(count ?? 0)
+    },
+
+    formatUsageTime(timestamp: number): string {
+      const date = new Date(timestamp)
+      return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
+    },
+
+    formatUsageCost(formatted: string): string {
+      const symbol = (formatted || '').charAt(0)
+      const value = Number((formatted || '').slice(1))
+      if (!Number.isFinite(value))
+        return formatted
+      const rounded = value.toFixed(4)
+      return `${symbol}${rounded.endsWith('0') ? String(Number(rounded)) : rounded}`
     },
 
     get serverLabel(): string {
@@ -892,6 +1089,19 @@ export function initApp(Alpine: AlpineType) {
     }
     else if (msg?.type === 'toast') {
       s.toast(msg.text, msg.level || 'info', msg.duration ?? 4000)
+    }
+    else if (msg?.type === 'usage') {
+      s.usage = msg.usage
+      if (msg.reveal)
+        s.usageOpen = true
+      if (msg.usage?.settings) {
+        s.usageRange = msg.usage.settings.range || 'today'
+        s.usageCurrency = msg.usage.settings.currency || 'CNY'
+      }
+      for (const provider of msg.usage?.providers || []) {
+        if (!(provider.id in s.usageProviderExpanded))
+          s.usageProviderExpanded[provider.id] = provider.totalCostMicros !== '0'
+      }
     }
   })
 

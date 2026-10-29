@@ -324,6 +324,39 @@ async function initializeSchema(database: AsyncDatabase): Promise<void> {
 
     CREATE INDEX IF NOT EXISTS idx_conversation_summaries_lookup
       ON conversation_summaries(conversation_id, kind, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS usage_logs (
+      request_id TEXT PRIMARY KEY,
+      provider_id TEXT NOT NULL,
+      provider_name TEXT NOT NULL,
+      provider_type TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      api_model TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      conversation_id TEXT,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+      input_cost_micros TEXT NOT NULL DEFAULT '0',
+      output_cost_micros TEXT NOT NULL DEFAULT '0',
+      cache_read_cost_micros TEXT NOT NULL DEFAULT '0',
+      cache_creation_cost_micros TEXT NOT NULL DEFAULT '0',
+      total_cost_micros TEXT NOT NULL DEFAULT '0',
+      currency TEXT NOT NULL DEFAULT 'CNY',
+      unpriced INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'ok',
+      error_message TEXT,
+      duration_ms INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_usage_logs_created_at
+      ON usage_logs(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_usage_logs_provider_model
+      ON usage_logs(provider_id, model_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_usage_logs_currency_created
+      ON usage_logs(currency, created_at DESC);
   `)
 
   // ── Schema 迁移: conversation_checkpoints 新增 kind 列 ──
@@ -408,6 +441,10 @@ export function getAgentDatabase(): AsyncDatabase {
     throw new Error('Database not initialized. Call initDatabase() first.')
   }
   return db
+}
+
+export function isAgentDatabaseReady(): boolean {
+  return db !== null
 }
 
 export async function closeAgentDatabase(): Promise<void> {

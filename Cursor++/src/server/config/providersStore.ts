@@ -58,6 +58,7 @@ function withFallback(loaded: Partial<ProvidersConfig> | null): ProvidersConfig 
   return {
     $schemaVersion: loaded.$schemaVersion ?? DEFAULT_PROVIDERS.$schemaVersion,
     providers: loaded.providers.map(p => ({
+      ...p,
       id: p.id,
       name: p.name ?? p.id,
       type: p.type,

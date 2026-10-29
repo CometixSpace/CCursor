@@ -9,6 +9,7 @@ export const CCURSOR_DIR_NAME = '.ccursor'
 export const ROUTES_FILE_NAME = 'routes.json'
 export const PROVIDERS_FILE_NAME = 'providers.json'
 export const DB_FILE_NAME = 'cursor.db'
+export const USAGE_SETTINGS_FILE_NAME = 'usage-settings.json'
 export const KNOWLEDGE_BASE_FILE_NAME = 'knowledge-base.json'
 
 export const DEFAULT_HOST = '127.0.0.1'
@@ -177,6 +178,16 @@ export interface ProviderModel {
    * 判定统一走 isModelDefaultOn(), 不要在调用点自己写 ?? / !== false。
    */
   defaultOn?: boolean
+  /** 输入单价，当前货币 / 百万 token */
+  inputCostPerMillion?: string
+  /** 输出单价，当前货币 / 百万 token */
+  outputCostPerMillion?: string
+  /** 缓存命中单价，当前货币 / 百万 token */
+  cacheReadCostPerMillion?: string
+  /** 缓存写入单价，当前货币 / 百万 token */
+  cacheCreationCostPerMillion?: string
+  /** 成本乘数，默认 1 */
+  costMultiplier?: string
   /** Fast 模式 — OpenAI: service_tier=priority / Anthropic: fast-mode beta */
   fastMode?: boolean
   /** 模型选择器里 hover 显示的 markdown tooltip (非 max mode) */
@@ -280,6 +291,26 @@ export interface ProvidersConfig {
 export const DEFAULT_PROVIDERS: ProvidersConfig = {
   $schemaVersion: 1,
   providers: [],
+}
+
+export interface UsageSettingsConfig {
+  $schemaVersion: number
+  currency: 'CNY' | 'USD'
+  range: 'today' | '7d' | '14d' | '30d' | 'month'
+  filterCustomized?: boolean
+  selectedProviderIds: string[]
+  selectedModelKeys: string[]
+  statusBarScope?: 'today' | 'month'
+}
+
+export const DEFAULT_USAGE_SETTINGS: UsageSettingsConfig = {
+  $schemaVersion: 1,
+  currency: 'CNY',
+  range: 'today',
+  filterCustomized: false,
+  selectedProviderIds: [],
+  selectedModelKeys: [],
+  statusBarScope: 'month',
 }
 
 export const MODELS_CATALOG_FILE_NAME = 'models-catalog.json'
