@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  extension:
+    name: Cursor++
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Cursor++
+    steps:
+      - uses: actions/checkout@v7
+
+      # pnpm 必须先于 setup-node 就位 —— setup-node 的 `cache: pnpm`
+      # 需要 PATH 上已有 pnpm 才能定位 store 目录。
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: Cursor++/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Type check
+        run: pnpm run check-types
+
+      - name: Lint
+        run: pnpm run lint
+
+      # 与 `pnpm run package` 的产物一致,但 check-types / lint 已单独跑过,
+      # 这里只验证 production bundle 能构建出来。
+      - name: Build
+        run: node esbuild.js --production
+
+      # 注意: `pnpm run test:server` 暂未接入 —— 38 个测试文件里有 5 个依赖
+      # 开发机环境,在干净 runner 上必然失败:
+      #
+      #   agentOrchestrator.integration / autoSummarize / chatSummary /
+      #   providerRuntime
+      #     database/sqlite.ts 的 loadSqlite3() 从**已安装的 Cursor**里
+      #     createRequire('@vscode/sqlite3'),runner 上没有 Cursor 就抛
+      #     "Failed to load @vscode/sqlite3"。CURSOR_APP_ROOT 能改路径,
+      #     但改不出一个不存在的 Cursor。
+      #
+      #   protocol.test.ts:232
+      #     断言 preamble 含 <user_rules>,而这段只有在真实的
+      #     ~/.ccursor/knowledge-base.json 里有条目时才会出现。
+      #
+      # 这 5 个文件解耦掉宿主依赖之后, 在 Build 之前加一步即可:
+      #   - name: Tests
+      #     run: pnpm run test:server
+
+  installer:
+    name: installer
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: installer
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: installer/package-lock.json
+
+      - run: npm ci
+
+      - name: Build
+        run: npm run build
