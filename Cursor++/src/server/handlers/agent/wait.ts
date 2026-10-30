@@ -19,6 +19,10 @@ export function isAgentRunAbortedError(error: unknown): error is AgentRunAborted
     return error instanceof AgentRunAbortedError;
 }
 
+export function isSessionCancellationError(session: AgentSession, error: unknown): error is AgentRunAbortedError {
+    return session.cancelledReason !== undefined && isAgentRunAbortedError(error);
+}
+
 /**
  * 客户端已发 cancelAction 则抛出中断,把控制权交回 conversationRuntime /
  * agentOrchestrator 的 isAgentRunAbortedError 分支干净收尾。

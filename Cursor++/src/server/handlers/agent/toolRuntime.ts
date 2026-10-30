@@ -35,25 +35,14 @@ import { interactionQuery } from './stream';
 import type { ToolResultEnvelope } from './toolResults';
 import type { ParsedRunRequest } from './protocol/types';
 import type { ReadContextState } from './contextCatalog';
+import {
+    createSubagentModelCatalog,
+    prepareSubagentTask,
+    type SubagentModelCatalog,
+    type SubagentModelSelection,
+} from './subagentCatalog';
 
 type SubagentModelOverride = ParsedRunRequest['subagentModelOverrides'][number];
-
-function resolveSubagentModel(
-    subagentType: string,
-    parentModelId: string,
-    overrides?: SubagentModelOverride[],
-): string {
-    const override = overrides?.find(o => o.subagentType === subagentType);
-    if (!override || override.selection.case === 'inherit') {
-        logger.debug({ subagentType, parentModelId, overrideCount: overrides?.length ?? 0 }, '[TOOL] subagent model → inherit parent');
-        return parentModelId;
-    }
-    if (override.selection.case === 'model' && override.selection.modelId) {
-        logger.info({ subagentType, modelId: override.selection.modelId, parentModelId }, '[TOOL] subagent model → override');
-        return override.selection.modelId;
-    }
-    return parentModelId;
-}
 
 export interface TaskLaunchContext {
     tc: ToolCallInfo;
@@ -62,6 +51,52 @@ export interface TaskLaunchContext {
     startedArgs: Record<string, unknown>;
     sanitizedInput: Record<string, unknown>;
     cursorToolType: string;
+    conversationId: string;
+    modelSelection: Extract<SubagentModelSelection, { case: 'selected' }>;
+}
+
+function finalizeTaskRejection(params: {
+    tc: ToolCallInfo;
+    executionToolName: string;
+    cursorToolType: string;
+    input: Record<string, unknown>;
+    error: string;
+    modelCallId: string;
+    conversationId: string;
+    roundContext: Pick<ProviderRoundContext, 'createToolResult' | 'recordToolResult'>;
+    messages: LLMMessage[];
+}): { startedArgs: Record<string, unknown>; completedFrame: AgentServerMessage } {
+    let startedArgs: Record<string, unknown>;
+    try {
+        startedArgs = buildToolArgs(params.executionToolName, params.input, params.tc.callId, {
+            conversationId: params.conversationId,
+        });
+    }
+    catch {
+        startedArgs = {
+            description: str(params.input.description),
+            prompt: str(params.input.prompt),
+        };
+    }
+    const finalized = finalizeToolCall({
+        roundContext: params.roundContext,
+        messages: params.messages,
+        cursorToolType: params.cursorToolType,
+        toolName: params.tc.name,
+        callId: params.tc.callId,
+        startedArgs,
+        rawToolResult: { result: { case: 'error', value: { error: params.error } } },
+        input: params.input,
+        modelCallId: params.modelCallId,
+    });
+    logger.warn({
+        conversationId: params.conversationId,
+        callId: params.tc.callId,
+        llmToolName: params.tc.name,
+        executionToolName: params.executionToolName,
+        error: params.error,
+    }, '[TOOL] taskToolCall rejected');
+    return { startedArgs, completedFrame: finalized.frame };
 }
 
 export async function* runToolCall(params: {
@@ -70,6 +105,7 @@ export async function* runToolCall(params: {
     conversationId: string;
     currentModelId: string;
     subagentModelOverrides?: SubagentModelOverride[];
+    subagentModelCatalog?: SubagentModelCatalog;
     round: number;
     session: AgentSession | null;
     roundContext: Pick<ProviderRoundContext, 'createToolResult' | 'recordToolResult'>;
@@ -134,19 +170,41 @@ async function* runToolCallInner(params: Parameters<typeof runToolCall>[0]): Asy
         return;
     }
 
-    // sanitizedInput 兜底补全:
-    //
-    //   - taskToolCall: BYOK 模式下 SubAgent 必须继承主对话模型 (方案 A)。
-    //     即便 taskTool.ts 的 schema 已经移除 model 字段, 这里仍然无条件强制
-    //     覆盖 model / modelId —— 防御 LLM 记忆里残留的 "composer-2-fast" 等
-    //     官方 fallback 路由名通过 schema 之外的途径溜进来 (例如 LLM 在
-    //     arguments 里塞了非 schema 字段)。客户端侧 SubAgent 靠这个字段决定
-    //     走哪个模型, 错了就直接挂。
     let sanitizedInput = resolvedTool.sanitizedInput;
     if (cursorToolType === 'taskToolCall') {
-        const subagentType = (sanitizedInput.subagent_type ?? sanitizedInput.subagentType ?? 'explore') as string;
-        const resolvedModelId = resolveSubagentModel(subagentType, params.currentModelId, params.subagentModelOverrides);
-        sanitizedInput = { ...sanitizedInput, model: resolvedModelId, modelId: resolvedModelId };
+        const preparedTask = prepareSubagentTask({
+            input: sanitizedInput,
+            parentModelId: params.currentModelId,
+            overrides: params.subagentModelOverrides,
+            catalog: params.subagentModelCatalog ?? createSubagentModelCatalog(),
+        });
+        if (preparedTask.case !== 'selected') {
+            const rejection = finalizeTaskRejection({
+                tc,
+                executionToolName,
+                cursorToolType,
+                input: sanitizedInput,
+                error: preparedTask.error,
+                modelCallId,
+                conversationId: params.conversationId,
+                roundContext: params.roundContext,
+                messages: params.messages,
+            });
+            yield toolCallStarted(tc.callId, cursorToolType, rejection.startedArgs, modelCallId);
+            yield rejection.completedFrame;
+            return;
+        }
+        sanitizedInput = preparedTask.input;
+        logger.info({
+            conversationId: params.conversationId,
+            callId: tc.callId,
+            selectionSource: preparedTask.selection.source,
+            modelId: preparedTask.selection.entry.modelId,
+            providerEntryId: preparedTask.selection.entry.providerEntryId,
+            providerEntryName: preparedTask.selection.entry.providerEntryName,
+            providerType: preparedTask.selection.entry.providerType,
+            apiModel: preparedTask.selection.entry.apiModel,
+        }, '[TOOL] taskToolCall model selected');
     }
     let startedArgs: Record<string, unknown>;
     try {
@@ -742,8 +800,11 @@ export async function* launchTaskTool(params: {
     conversationId: string;
     currentModelId: string;
     subagentModelOverrides?: SubagentModelOverride[];
+    subagentModelCatalog?: SubagentModelCatalog;
     round: number;
     allocateExecMessageId: () => number;
+    roundContext: Pick<ProviderRoundContext, 'createToolResult' | 'recordToolResult'>;
+    messages: LLMMessage[];
     /** cursor namespace 已注册的内置工具 —— Task 经 CallDynamicTool 进来时据此解包 */
     cursorDynamicTools?: AvailableDynamicBuiltinTool[];
 }): AsyncGenerator<AgentServerMessage, TaskLaunchContext | null, void> {
@@ -761,18 +822,61 @@ export async function* launchTaskTool(params: {
     const modelCallId = `${params.conversationId}-${params.round}-${tc.callId.slice(-4)}`;
 
     let sanitizedInput = resolvedTool.sanitizedInput;
-    const subagentType = (sanitizedInput.subagent_type ?? sanitizedInput.subagentType ?? 'explore') as string;
-    const resolvedModelId = resolveSubagentModel(subagentType, params.currentModelId, params.subagentModelOverrides);
-    sanitizedInput = { ...sanitizedInput, model: resolvedModelId, modelId: resolvedModelId };
+    if (resolvedTool.resolutionError) {
+        const rejection = finalizeTaskRejection({
+            tc,
+            executionToolName,
+            cursorToolType,
+            input: sanitizedInput,
+            error: resolvedTool.resolutionError,
+            modelCallId,
+            conversationId: params.conversationId,
+            roundContext: params.roundContext,
+            messages: params.messages,
+        });
+        yield toolCallStarted(tc.callId, cursorToolType, rejection.startedArgs, modelCallId);
+        yield rejection.completedFrame;
+        return null;
+    }
+    const preparedTask = prepareSubagentTask({
+        input: sanitizedInput,
+        parentModelId: params.currentModelId,
+        overrides: params.subagentModelOverrides,
+        catalog: params.subagentModelCatalog ?? createSubagentModelCatalog(),
+    });
+    if (preparedTask.case !== 'selected') {
+        const rejection = finalizeTaskRejection({
+            tc,
+            executionToolName,
+            cursorToolType,
+            input: sanitizedInput,
+            error: preparedTask.error,
+            modelCallId,
+            conversationId: params.conversationId,
+            roundContext: params.roundContext,
+            messages: params.messages,
+        });
+        yield toolCallStarted(tc.callId, cursorToolType, rejection.startedArgs, modelCallId);
+        yield rejection.completedFrame;
+        return null;
+    }
+    sanitizedInput = preparedTask.input;
+    const { subagentType, selection } = preparedTask;
 
     logger.info({
+        conversationId: params.conversationId,
         callId: tc.callId,
         llmToolName: tc.name,
         executionToolName,
         runInBackground: sanitizedInput.run_in_background ?? sanitizedInput.runInBackground ?? '(unset)',
         resume: sanitizedInput.resume ?? '(none)',
         subagentType,
-        resolvedModelId,
+        selectionSource: selection.source,
+        modelId: selection.entry.modelId,
+        providerEntryId: selection.entry.providerEntryId,
+        providerEntryName: selection.entry.providerEntryName,
+        providerType: selection.entry.providerType,
+        apiModel: selection.entry.apiModel,
     }, '[TOOL] taskToolCall dispatching');
 
     let startedArgs: Record<string, unknown>;
@@ -784,7 +888,19 @@ export async function* launchTaskTool(params: {
     }
     catch (e) {
         const errorMsg = e instanceof Error ? e.message : String(e);
-        logger.warn({ tool: tc.name, callId: tc.callId, error: errorMsg }, '[TOOL] taskToolCall buildStartedArgs failed');
+        const rejection = finalizeTaskRejection({
+            tc,
+            executionToolName,
+            cursorToolType,
+            input: sanitizedInput,
+            error: errorMsg,
+            modelCallId,
+            conversationId: params.conversationId,
+            roundContext: params.roundContext,
+            messages: params.messages,
+        });
+        yield toolCallStarted(tc.callId, cursorToolType, rejection.startedArgs, modelCallId);
+        yield rejection.completedFrame;
         return null;
     }
 
@@ -802,14 +918,34 @@ export async function* launchTaskTool(params: {
     }
     catch (e) {
         const errorMsg = e instanceof Error ? e.message : String(e);
-        logger.warn({ tool: tc.name, callId: tc.callId, error: errorMsg }, '[TOOL] taskToolCall buildExecArgs failed');
+        const rejection = finalizeTaskRejection({
+            tc,
+            executionToolName,
+            cursorToolType,
+            input: sanitizedInput,
+            error: errorMsg,
+            modelCallId,
+            conversationId: params.conversationId,
+            roundContext: params.roundContext,
+            messages: params.messages,
+        });
+        yield rejection.completedFrame;
         return null;
     }
 
     const execMessageId = params.allocateExecMessageId();
     yield execMessage(execMessageId, `${tc.callId}-exec`, 'subagentArgs', args);
 
-    return { tc, execMessageId, modelCallId, startedArgs, sanitizedInput, cursorToolType };
+    return {
+        tc,
+        execMessageId,
+        modelCallId,
+        startedArgs,
+        sanitizedInput,
+        cursorToolType,
+        conversationId: params.conversationId,
+        modelSelection: selection,
+    };
 }
 
 /** Phase 3: 并发 await 全部 Task 结果，生成 completedFrame */
@@ -819,14 +955,22 @@ export function finalizeTaskResult(
     roundContext: Pick<ProviderRoundContext, 'createToolResult' | 'recordToolResult'>,
     messages: LLMMessage[],
     session?: AgentSession | null,
+    failureMessage?: string,
 ): AgentServerMessage {
     if (execResult && 'execClientMessage' in execResult) {
         const ecm = execResult.execClientMessage as Record<string, unknown>;
         const sr = ecm.subagentResult as Record<string, unknown> | undefined;
         const success = sr?.success as Record<string, unknown> | undefined;
         logger.info({
+            conversationId: ctx.conversationId,
             tool: ctx.tc.name,
             callId: ctx.tc.callId,
+            selectionSource: ctx.modelSelection.source,
+            modelId: ctx.modelSelection.entry.modelId,
+            providerEntryId: ctx.modelSelection.entry.providerEntryId,
+            providerEntryName: ctx.modelSelection.entry.providerEntryName,
+            providerType: ctx.modelSelection.entry.providerType,
+            apiModel: ctx.modelSelection.entry.apiModel,
             agentId: success?.agentId,
             toolCallCount: success?.toolCallCount,
             finalMsgLen: typeof success?.finalMessage === 'string' ? success.finalMessage.length : 0,
@@ -861,7 +1005,14 @@ export function finalizeTaskResult(
         return finalized.frame;
     }
 
-    logger.warn({ tool: ctx.tc.name, callId: ctx.tc.callId }, '[TOOL] task exec ended without result');
+    const errorMessage = failureMessage || 'no result';
+    logger.warn({
+        conversationId: ctx.conversationId,
+        tool: ctx.tc.name,
+        callId: ctx.tc.callId,
+        modelId: ctx.modelSelection.entry.modelId,
+        error: errorMessage,
+    }, '[TOOL] task exec ended without result');
     const finalized = finalizeToolCall({
         roundContext,
         messages,
@@ -869,7 +1020,7 @@ export function finalizeTaskResult(
         toolName: ctx.tc.name,
         callId: ctx.tc.callId,
         startedArgs: ctx.startedArgs,
-        rawToolResult: { result: { case: 'error', value: { message: 'no result' } } },
+        rawToolResult: { result: { case: 'error', value: { message: errorMessage } } },
         input: ctx.sanitizedInput,
         modelCallId: ctx.modelCallId,
     });

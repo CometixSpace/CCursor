@@ -85,12 +85,7 @@ Available subagent_types and a quick description of what they do:
 - security-review: Security audit specialist. Performs security-focused code review covering common vulnerability patterns, authentication/authorization issues, and data handling concerns.
 - cursorBlameLearning: Code history analyst. Produces story-style learning reports about how code was built — who changed it, why, what tradeoffs were discussed. Use when the user asks about history, evolution, authorship, or rationale.
 
-Available models:
-- fast (cost: 1/10, intelligence: 5/10): Extremely fast, moderately intelligent model that is effective for tightly scoped changes. Not well-suited for long-horizon tasks or deep investigations.
-
-When speaking to the USER about which model you selected for a Task/subagent, do NOT reveal these internal model alias names. Instead, use natural language such as "a faster model", "a more capable model", or "the default model".
-
-When choosing a model, prefer \`fast\` for quick, straightforward tasks to minimize cost and latency. Only choose a named alternative model when there is a specific reason — for example, the task requires deep multi-step reasoning, very high code quality, multimodal understanding, or the user explicitly requests a more capable model.`,
+The model field, when present, must be a canonical ProviderModel.id advertised in this Task schema.`,
     inputSchema: {
             "type": "object",
             "required": [
@@ -120,10 +115,7 @@ When choosing a model, prefer \`fast\` for quick, straightforward tasks to minim
                     },
                     "model": {
                             "type": "string",
-                            "enum": [
-                                    "fast"
-                            ],
-                            "description": "Optional model to use for this agent. If not specified, inherits from parent. Prefer fast for quick, straightforward tasks to minimize cost and latency. Only select a different model when the task specifically benefits from it (e.g., deep reasoning, high-quality code review, multimodal input)"
+                            "description": "Optional canonical ProviderModel.id for this Subagent. The per-run schema supplies the available IDs."
                     },
                     "readonly": {
                             "type": "boolean",
@@ -136,13 +128,6 @@ When choosing a model, prefer \`fast\` for quick, straightforward tasks to minim
                     "resume": {
                             "type": "string",
                             "description": "Optional agent ID to resume from. If provided, sends a follow-up message to the agent when its turn is complete. Use \"self\" to start a new agent with your own entire conversation history as a starting point (aka 'self-fork')."
-                    },
-                    "attachments": {
-                            "type": "array",
-                            "description": "Optional array of file paths to videos to pass to video-review subagents. Files are read and attached to the subagent's context. Supports video formats (mp4, webm) for Gemini models.",
-                            "items": {
-                                    "type": "string"
-                            }
                     }
             }
     },
@@ -192,12 +177,7 @@ Available subagent_types and a quick description of what they do:
 - security-review: Security audit specialist. Performs security-focused code review covering common vulnerability patterns, authentication/authorization issues, and data handling concerns.
 - cursorBlameLearning: Code history analyst. Produces story-style learning reports about how code was built — who changed it, why, what tradeoffs were discussed. Use when the user asks about history, evolution, authorship, or rationale.
 
-Available models:
-- fast (cost: 1/10, intelligence: 5/10): Extremely fast, moderately intelligent model that is effective for tightly scoped changes. Not well-suited for long-horizon tasks or deep investigations.
-
-When speaking to the USER about which model you selected for a Task/subagent, do NOT reveal these internal model alias names. Instead, use natural language such as "a faster model", "a more capable model", or "the default model".
-
-When choosing a model, prefer \`fast\` for quick, straightforward tasks to minimize cost and latency. Only select a different model when there is a specific reason — for example, the task requires deep multi-step reasoning, very high code quality, multimodal understanding, or the user explicitly requests a more capable model.`,
+The model field, when present, must be a canonical ProviderModel.id advertised in this Subagent schema.`,
     inputSchema: {
             "type": "object",
             "properties": {
@@ -211,10 +191,7 @@ When choosing a model, prefer \`fast\` for quick, straightforward tasks to minim
                     },
                     "model": {
                             "type": "string",
-                            "description": "Optional model to use for this agent. If not specified, inherits from parent. Prefer fast for quick, straightforward tasks to minimize cost and latency. Only select a different model when the task specifically benefits from it (e.g., deep reasoning, high-quality code review, multimodal input)",
-                            "enum": [
-                                    "fast"
-                            ]
+                            "description": "Optional canonical ProviderModel.id for this Subagent. The per-run schema supplies the available IDs."
                     },
                     "resume": {
                             "type": "string",
@@ -233,13 +210,6 @@ When choosing a model, prefer \`fast\` for quick, straightforward tasks to minim
                                     "shell",
                                     "best-of-n-runner"
                             ]
-                    },
-                    "attachments": {
-                            "type": "array",
-                            "description": "Optional array of file paths to videos to pass to video-review subagents. Files are read and attached to the subagent's context. Supports video formats (mp4, webm) for Gemini models.",
-                            "items": {
-                                    "type": "string"
-                            }
                     },
                     "run_in_background": {
                             "type": "boolean",
@@ -299,32 +269,17 @@ Available subagent_types and a quick description of what they do:
 - security-review: Security audit specialist. Performs security-focused code review covering common vulnerability patterns, authentication/authorization issues, and data handling concerns.
 - cursorBlameLearning: Code history analyst. Produces story-style learning reports about how code was built — who changed it, why, what tradeoffs were discussed. Use when the user asks about history, evolution, authorship, or rationale.
 
-Available models:
-- fast (cost: 1/10, intelligence: 5/10): Extremely fast, moderately intelligent model that is effective for tightly scoped changes. Not well-suited for long-horizon tasks or deep investigations.
-
-When speaking to the USER about which model you selected for a Task/subagent, do NOT reveal these internal model alias names. Instead, use natural language such as "a faster model", "a more capable model", or "the default model".
-
-When choosing a model, prefer \`fast\` for quick, straightforward tasks to minimize cost and latency. Only choose a named alternative model when there is a specific reason — for example, the task requires deep multi-step reasoning, very high code quality, multimodal understanding, or the user explicitly requests a more capable model.`,
+The model field, when present, must be a canonical ProviderModel.id advertised in this Task schema.`,
     inputSchema: {
             "type": "OBJECT",
             "properties": {
-                    "attachments": {
-                            "type": "ARRAY",
-                            "description": "Optional array of file paths to videos to pass to video-review subagents. Files are read and attached to the subagent's context. Supports video formats (mp4, webm) for Gemini models.",
-                            "items": {
-                                    "type": "STRING"
-                            }
-                    },
                     "description": {
                             "type": "STRING",
                             "description": "A short (3-5 word) description of the task"
                     },
                     "model": {
                             "type": "STRING",
-                            "enum": [
-                                    "fast"
-                            ],
-                            "description": "Optional model to use for this agent. If not specified, inherits from parent. Prefer fast for quick, straightforward tasks to minimize cost and latency. Only select a different model when the task specifically benefits from it (e.g., deep reasoning, high-quality code review, multimodal input)"
+                            "description": "Optional canonical ProviderModel.id for this Subagent. The per-run schema supplies the available IDs."
                     },
                     "prompt": {
                             "type": "STRING",

@@ -17,13 +17,12 @@ import { buildMessages, workspaceUris } from './protocol'
 import { checkpoint, editToolCallStreamDelta, heartbeat, kvMessage, partialToolCall, summary, summaryCompleted, summaryStarted, translateStream, userMessageAppended } from './stream'
 import { buildSummaryUserMessage, SUMMARY_SYSTEM_PROMPT } from './summaryPrompt'
 import { finalizeTaskResult, launchTaskTool, runToolCall, type TaskLaunchContext } from './toolRuntime'
-import { awaitExecResultAndClose, waitForPromiseWithHeartbeat } from './wait'
+import { awaitExecResultAndClose, isAgentRunAbortedError, isSessionCancellationError, throwIfSessionCancelled, waitForPromiseWithHeartbeat } from './wait'
 import { restoreBlobMessageToLLMMessage } from './transcript'
 import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, readTurnBaseline } from './turnTracker'
 import { contextualizeDynamicMetaTools, partitionCursorBuiltinTools, shouldEnableBuiltinDynamicProfile } from './dynamicTools'
-import { contextualizeSubagentTools } from './subagentCatalog'
+import { contextualizeSubagentTools, createSubagentModelCatalog } from './subagentCatalog'
 import { addUsage, clampTokenDetails, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold, shouldTriggerCompaction } from './usage'
-import { isAgentRunAbortedError, throwIfSessionCancelled } from './wait'
 import { isSessionCancelled } from './session'
 import { makeProviderError, makeToolError } from '../errors'
 import { createRepairDiagnostics, hasRepairMutations, repairConversationHistory } from '../llm/transformMessages'
@@ -722,9 +721,11 @@ export async function* handleConversationRun(
     previousDynamicToolCount,
     isSubagent: parsed.isSubagent,
   })
+  const subagentModelCatalog = createSubagentModelCatalog()
   const contextualizedBuiltinTools = contextualizeSubagentTools(
     route.toolCatalog.listBuiltins(),
     parsed.customSubagents,
+    subagentModelCatalog,
   )
   const modeFilteredBuiltins = route.listRuntimeTools(
     [],
@@ -961,6 +962,15 @@ export async function* handleConversationRun(
   const userPreview = parsed.isExecutePlan && parsed.executePlanContent
     ? `[ExecutePlan] ${parsed.executePlanContent.match(/^---\s*\nname:\s*(.+)/m)?.[1]?.trim() ?? parsed.executePlanFileUri ?? 'plan'}`
     : parsed.userText.length > 80 ? `${parsed.userText.slice(0, 80)}...` : parsed.userText
+  logger.info({
+    conversationId: parsed.conversationId,
+    isSubagent: parsed.isSubagent,
+    modelId: route.modelId,
+    providerEntryId: route.providerEntryId,
+    providerEntryName: route.providerEntryName,
+    providerType: route.providerType,
+    apiModel: route.model,
+  }, '[AGENT] provider route selected')
   logger.info(`[AGENT] → [${route.provider.name}/${route.model}] "${userPreview}" (${messages.length} msgs)`)
 
   const usageTotals = emptyUsageTotals()
@@ -1232,16 +1242,30 @@ export async function* handleConversationRun(
         // Task 掉进 Phase 2 串行路径,丢掉并发启动与 subagent 模型解析。
         const executionToolName = resolveExecutionToolName(tc.name, tc.input, parsed.cursorDynamicTools)
         if ((executionToolName === 'Task' || executionToolName === 'Subagent') && session) {
-          const ctx = yield* launchTaskTool({
+          const launchIterator = launchTaskTool({
             toolCall: tc,
             availableMcpTools: parsed.mcpTools,
             conversationId: parsed.conversationId,
             currentModelId: parsed.modelId,
             subagentModelOverrides: parsed.subagentModelOverrides,
+            subagentModelCatalog,
             round,
             allocateExecMessageId: () => ++blobCounter,
             cursorDynamicTools: parsed.cursorDynamicTools,
+            roundContext,
+            messages,
           })
+          let launchStep = await launchIterator.next()
+          while (!launchStep.done) {
+            const completedToolCall = extractCompletedToolCall(launchStep.value)
+            if (activeTurn && completedToolCall) {
+              const toolBlob = activeTurn.addCompletedToolCall(completedToolCall)
+              yield cacheAndBuildKvBlob(++blobCounter, toolBlob)
+            }
+            yield launchStep.value
+            launchStep = await launchIterator.next()
+          }
+          const ctx = launchStep.value
           if (ctx)
             taskLaunches.push(ctx)
         }
@@ -1261,6 +1285,7 @@ export async function* handleConversationRun(
           conversationId: parsed.conversationId,
           currentModelId: parsed.modelId,
           subagentModelOverrides: parsed.subagentModelOverrides,
+          subagentModelCatalog,
           round,
           session,
           roundContext,
@@ -1291,11 +1316,29 @@ export async function* handleConversationRun(
       // ── Phase 3: 并发等待所有 Task 结果 ──
       if (taskLaunches.length > 0 && session) {
         const resultPromises = taskLaunches.map(ctx =>
-          awaitExecResultAndClose(session, ctx.execMessageId),
+          awaitExecResultAndClose(session, ctx.execMessageId).then(
+            value => ({ case: 'success' as const, value }),
+            (error) => {
+              if (isSessionCancellationError(session, error))
+                throw error
+              return {
+                case: 'error' as const,
+                error: error instanceof Error ? error.message : String(error),
+              }
+            },
+          ),
         )
         const results = yield* waitForPromiseWithHeartbeat(Promise.all(resultPromises))
         for (let i = 0; i < taskLaunches.length; i++) {
-          const frame = finalizeTaskResult(taskLaunches[i], results[i], roundContext, messages, session)
+          const outcome = results[i]
+          const frame = finalizeTaskResult(
+            taskLaunches[i],
+            outcome.case === 'success' ? outcome.value : null,
+            roundContext,
+            messages,
+            session,
+            outcome.case === 'error' ? outcome.error : undefined,
+          )
           const completedToolCall = extractCompletedToolCall(frame)
           if (activeTurn && completedToolCall) {
             const toolBlob = activeTurn.addCompletedToolCall(completedToolCall)

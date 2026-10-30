@@ -1,4 +1,5 @@
 import type { AgentServerMessage } from '../gen/agent_v1_pb'
+import type { LLMMessage, LLMToolResultBlock } from '../handlers/llm/types'
 import { describe, expect, it } from 'vitest'
 import { mergeMcpStateIntoRoutingTable } from '../handlers/agent/mcpState'
 import { buildToolArgs } from '../handlers/agent/toolBuilders'
@@ -242,6 +243,7 @@ describe('cursor namespace 的原生工具身份', () => {
 
   it('经 CallDynamicTool 启动的 Task 走 subagent 通道,不走 mcpArgs', async () => {
     const frames: AgentServerMessage[] = []
+    const messages: LLMMessage[] = []
     const iterator = launchTaskTool({
       toolCall: {
         callId: 'call-task-1',
@@ -254,10 +256,23 @@ describe('cursor namespace 的原生工具身份', () => {
       },
       availableMcpTools: AVAILABLE,
       conversationId: 'conv-1',
-      currentModelId: 'test-model',
+      currentModelId: 'gpt-5.4-medium',
       round: 0,
       allocateExecMessageId: () => 1,
       cursorDynamicTools: [{ tool: 'Task' }],
+      messages,
+      roundContext: {
+        createToolResult: params => ({
+          type: 'tool_result',
+          toolUseId: params.toolCallId,
+          toolName: params.toolName,
+          content: params.content,
+          isError: params.isError,
+        }),
+        recordToolResult: (_messages: LLMMessage[], result: LLMToolResultBlock) => {
+          messages.push({ role: 'user', content: [result] })
+        },
+      },
     })
     let result = await iterator.next()
     while (!result.done) {
@@ -290,6 +305,7 @@ describe('cursor namespace 的原生工具身份', () => {
     expect(execFrame.message.value.message.value).toMatchObject({
       prompt: 'look around',
       subagentType: 'explore',
+      modelId: 'gpt-5.4-medium',
     })
   })
 })

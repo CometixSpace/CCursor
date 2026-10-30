@@ -52,6 +52,10 @@ export interface ProviderRoundContext {
 
 export interface ProviderRuntime {
     provider: LLMProvider;
+    modelId: string;
+    providerEntryId: string;
+    providerEntryName: string;
+    providerType: ProviderType;
     stateStrategy: ProviderStateStrategy;
     conversationCodec: ProviderConversationCodec;
     promptProfile: ProviderPromptProfile;
@@ -149,6 +153,10 @@ export function resolveProviderRuntime(modelId: string): ProviderRuntime {
     };
     return {
         provider: getProviderForEntry(providerEntry),
+        modelId,
+        providerEntryId: providerEntry.id,
+        providerEntryName: providerEntry.name,
+        providerType: resolved.provider,
         stateStrategy,
         conversationCodec,
         promptProfile,

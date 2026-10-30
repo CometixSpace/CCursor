@@ -8,7 +8,9 @@ import {
   waitForMessageMatching,
 } from '../handlers/agent/session'
 import {
+  AgentRunAbortedError,
   isAgentRunAbortedError,
+  isSessionCancellationError,
   throwIfSessionCancelled,
   waitForExecMessageMatching,
 } from '../handlers/agent/wait'
@@ -114,5 +116,15 @@ describe('中断对等待中的工具的影响', () => {
     expect(() => throwIfSessionCancelled(session)).not.toThrow()
     pushSessionMessage(session, cancelMessage('user_stopped_generation'))
     expect(() => throwIfSessionCancelled(session)).toThrow(/user_stopped_generation/)
+  })
+
+  it('区分父会话取消与单个 exec throw', () => {
+    const session = createEphemeralSession('cancel-9')
+    const execError = new AgentRunAbortedError('subagent failed', { execMessageId: 9 })
+
+    expect(isSessionCancellationError(session, execError)).toBe(false)
+
+    pushSessionMessage(session, cancelMessage('user_stopped_generation'))
+    expect(isSessionCancellationError(session, execError)).toBe(true)
   })
 })

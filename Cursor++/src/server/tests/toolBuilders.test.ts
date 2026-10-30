@@ -258,9 +258,9 @@ it('buildExecArgs for readLintsToolCall uses first path from paths[]', () => {
   expect(args.toolCallId).toBe('call-2')
 })
 
-it('task tool exec args match official subagent launch fields (方案 A: LLM 传入的 model 被忽略, 强制继承 currentModelId)', () => {
-  // 输入里故意塞一个 "composer-2-fast" 模拟 LLM 被原 schema 描述诱导的行为。
-  // 方案 A 下 buildExecArgs 应当完全忽略这个字段, 改用 options.currentModelId。
+it('task tool exec args use the canonical model prepared by the runtime', () => {
+  // buildExecArgs 只信任 runtime 通过 options 传入的已校验 canonical id。
+  // 原始 input.model 不得绕过 catalog validation 直接进入 SubagentArgs。
   const args = buildExecArgs('Task', {
     description: 'Find python script',
     prompt: 'Please find the name of the Python script that captures Claude status in this repository. Return just the filename.',
