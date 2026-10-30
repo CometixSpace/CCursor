@@ -12,7 +12,7 @@ import { cacheBlob, getCachedBlob } from './blobStore'
 import { emitFinalCheckpoint, emitRollingCheckpoint } from './checkpointManager'
 import { ContextTokenTracker } from './tokenCounter'
 import { createCompactionArtifacts, estimateMessagesTokens, formatMessageForSummary, planCompaction } from './compactionStrategy'
-import { extractPlainTextContent, flushMessageBlobs, hydrateHistoryEntries, rebuildConversationHistory, repairHistoryEntries, sendAndCacheBlob } from './historyManager'
+import { extractPlainTextContent, flushMessageBlobs, hydrateHistoryEntries, isSummaryBlobMessage, rebuildConversationHistory, repairHistoryEntries, sendAndCacheBlob } from './historyManager'
 import { buildMessages, workspaceUris } from './protocol'
 import { checkpoint, editToolCallStreamDelta, heartbeat, kvMessage, partialToolCall, summary, summaryCompleted, summaryStarted, translateStream, userMessageAppended } from './stream'
 import { buildSummaryUserMessage, SUMMARY_SYSTEM_PROMPT } from './summaryPrompt'
@@ -510,7 +510,7 @@ function flushPendingAssistantPrefix(params: {
  * 7. yield summaryCompleted — 通知客户端 summarize 完成
  * 8. 返回 compacted 状态供后续 round 继续使用
  */
-async function* performInlineAutoSummarize(params: {
+export async function* performInlineAutoSummarize(params: {
   parsed: ParsedRunRequest
   allBlobIds: string[]
   summaryArchiveIds: string[]
@@ -532,7 +532,12 @@ async function* performInlineAutoSummarize(params: {
     return null
 
   const compactionPlan = planCompaction(historyEntries)
-  if (compactionPlan.summarizeEntries.length === 0) {
+  // 规范化历史可能丢失 isSummary 元数据，兼容已有摘要的固定前缀。
+  if (compactionPlan.summarizeEntries.length === 0
+    || compactionPlan.summarizeEntries.every(entry => isSummaryBlobMessage(entry.raw)
+      || (entry.message.role === 'assistant'
+        && typeof entry.message.content === 'string'
+        && entry.message.content.startsWith('Previous conversation summary:\n')))) {
     logger.info({ conversationId: parsed.conversationId }, '[AGENT] auto-summarize: nothing to compact')
     return null
   }
@@ -591,6 +596,22 @@ async function* performInlineAutoSummarize(params: {
     summaryText = '- Prior conversation compacted.'
   }
 
+  const previousTokenEstimate = estimateMessagesTokens(historyEntries.map(entry => entry.message))
+  const compactedTokenEstimate = estimateMessagesTokens([
+    ...compactionPlan.leading.map(entry => entry.message),
+    { role: 'assistant', content: `Previous conversation summary:\n${summaryText}` },
+    ...compactionPlan.keepTail.map(entry => entry.message),
+  ])
+  if (compactedTokenEstimate >= previousTokenEstimate) {
+    logger.warn({
+      conversationId: parsed.conversationId,
+      previousTokenEstimate,
+      newTokenEstimate: compactedTokenEstimate,
+    }, '[AGENT] auto-summarize: no token reduction; preserving history')
+    yield summaryCompleted('Compaction did not reduce context; history preserved.')
+    return null
+  }
+
   const artifacts = createCompactionArtifacts({
     plan: compactionPlan,
     summaryText,
@@ -602,12 +623,11 @@ async function* performInlineAutoSummarize(params: {
     yield kvMessage(2 + index, archiveBlob.blobId, archiveBlob.blobData, archiveBlob.blobDataRaw)
   }
 
+  // 沿用压缩前 usage 与本地估算的比例，避免压缩后切换计数口径。
   const compactedTokenDetails = clampTokenDetails(
-    estimateMessagesTokens([
-      ...compactionPlan.leading.map(entry => entry.message),
-      { role: 'assistant', content: `Previous conversation summary:\n${artifacts.summaryText}` },
-      ...compactionPlan.keepTail.map(entry => entry.message),
-    ]),
+    usedTokensEstimate > 0
+      ? Math.min(usedTokensEstimate, Math.round(compactedTokenEstimate * usedTokensEstimate / Math.max(1, previousTokenEstimate)))
+      : compactedTokenEstimate,
     contextTokenLimit,
   )
 
