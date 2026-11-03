@@ -14,13 +14,21 @@ function clone<T>(value: T): T {
 
 let cache: WebToolsConfig | null = null
 
+/** Saved configs predate providers added later; append those (disabled) so they can be toggled. */
+function withNewProviders(saved: WebToolsConfig['search']['providers'] | undefined): WebToolsConfig['search']['providers'] {
+  if (!saved)
+    return clone(DEFAULT_WEB_TOOLS.search.providers)
+  const missing = DEFAULT_WEB_TOOLS.search.providers.filter(d => !saved.some(p => p.type === d.type))
+  return [...saved, ...clone(missing)]
+}
+
 function withFallback(loaded: Partial<WebToolsConfig> | null): WebToolsConfig {
   if (!loaded)
     return clone(DEFAULT_WEB_TOOLS)
   return {
     $schemaVersion: loaded.$schemaVersion ?? DEFAULT_WEB_TOOLS.$schemaVersion,
     search: {
-      providers: loaded.search?.providers ?? clone(DEFAULT_WEB_TOOLS.search.providers),
+      providers: withNewProviders(loaded.search?.providers),
       parallel: loaded.search?.parallel ?? DEFAULT_WEB_TOOLS.search.parallel,
       maxResults: loaded.search?.maxResults ?? DEFAULT_WEB_TOOLS.search.maxResults,
     },
