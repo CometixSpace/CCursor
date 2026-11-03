@@ -279,6 +279,29 @@ async function searchTavily(apiKey: string, searchTerm: string, max: number): Pr
   })).filter((r: SearchRef) => r.title && r.url)
 }
 
+// Keenable: keyless public endpoint; an API key (optional) uses the keyed one.
+async function searchKeenable(apiKey: string, searchTerm: string, max: number): Promise<SearchRef[]> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json', 'X-Keenable-Title': 'Cursor++' }
+  if (apiKey)
+    headers['X-API-Key'] = apiKey
+  const endpoint = apiKey ? 'https://api.keenable.ai/v1/search' : 'https://api.keenable.ai/v1/search/public'
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ query: searchTerm, max_results: Math.min(max, 20) }),
+    signal: AbortSignal.timeout(15_000),
+  })
+  if (!res.ok)
+    throw new Error(`Keenable search failed: ${res.status}`)
+  const json = await res.json() as any
+  return (json.results || []).map((r: any) => ({
+    title: r.title || '',
+    url: r.url || '',
+    // `description` is often empty; `snippet` can be a whole page.
+    chunk: (r.description || r.snippet || '').slice(0, 1000),
+  })).filter((r: SearchRef) => r.title && r.url)
+}
+
 async function searchBrave(apiKey: string, searchTerm: string, max: number): Promise<SearchRef[]> {
   const params = new URLSearchParams({ q: searchTerm, count: String(max), extra_snippets: '1' })
   const res = await fetch(`https://api.search.brave.com/res/v1/web/search?${params}`, {
@@ -344,6 +367,7 @@ async function searchWithProvider(provider: SearchProviderEntry, searchTerm: str
     case 'exa': return searchExa(provider.apiKey!, searchTerm, max)
     case 'tavily': return searchTavily(provider.apiKey!, searchTerm, max)
     case 'brave': return searchBrave(provider.apiKey!, searchTerm, max)
+    case 'keenable': return searchKeenable(provider.apiKey || '', searchTerm, max)
     case 'jina': return searchJina(provider.apiKey || '', searchTerm, max)
     case 'firecrawl': return searchFirecrawl(provider.apiKey!, searchTerm, max)
     default: throw new Error(`unknown search provider: ${provider.type}`)
@@ -373,7 +397,7 @@ function deduplicateResults(results: SearchRef[], max: number): SearchRef[] {
 
 export async function performWebSearch(searchTerm: string, config?: WebToolsConfig['search']): Promise<SearchRef[]> {
   const cfg = config ?? getSearchConfig()
-  const enabled = cfg.providers.filter(p => p.enabled && (p.type === 'duckduckgo' || p.apiKey))
+  const enabled = cfg.providers.filter(p => p.enabled && (p.type === 'duckduckgo' || p.type === 'keenable' || p.apiKey))
   if (enabled.length === 0) {
     return searchDuckDuckGo(searchTerm, cfg.maxResults)
   }

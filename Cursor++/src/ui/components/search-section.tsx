@@ -8,6 +8,7 @@ const SEARCH_PROVIDERS = [
   { type: 'brave', name: 'Brave Search', needsKey: true, hint: 'Independent index — ~1,000 free/month' },
   { type: 'jina', name: 'Jina', needsKey: true, hint: 'Full content extraction — 10M free tokens' },
   { type: 'firecrawl', name: 'Firecrawl', needsKey: true, hint: 'Scrape + search — self-hostable' },
+  { type: 'keenable', name: 'Keenable', needsKey: false, hint: 'AI-agent search — free, no API key needed' },
 ] as const
 
 const FETCH_PROVIDERS = [

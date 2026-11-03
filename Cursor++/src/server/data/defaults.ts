@@ -288,7 +288,7 @@ export const MANAGED_SKILLS_FILE_NAME = 'managed-skills.json'
 
 // ── Web Tools (Search + Fetch) ──
 
-export type SearchProviderType = 'duckduckgo' | 'exa' | 'tavily' | 'brave' | 'jina' | 'firecrawl'
+export type SearchProviderType = 'duckduckgo' | 'exa' | 'tavily' | 'brave' | 'jina' | 'firecrawl' | 'keenable'
 
 export interface SearchProviderEntry {
   id: string
@@ -325,6 +325,7 @@ export const DEFAULT_WEB_TOOLS: WebToolsConfig = {
       { id: 'default-brave', type: 'brave', enabled: false },
       { id: 'default-jina', type: 'jina', enabled: false },
       { id: 'default-firecrawl', type: 'firecrawl', enabled: false },
+      { id: 'default-keenable', type: 'keenable', enabled: false },
     ],
     parallel: false,
     maxResults: 10,
