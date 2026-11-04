@@ -57,6 +57,7 @@ function withFallback(loaded: Partial<ProvidersConfig> | null): ProvidersConfig 
     return clone(DEFAULT_PROVIDERS)
   return {
     $schemaVersion: loaded.$schemaVersion ?? DEFAULT_PROVIDERS.$schemaVersion,
+    visionModelId: typeof loaded.visionModelId === 'string' ? loaded.visionModelId : '',
     providers: loaded.providers.map(p => ({
       id: p.id,
       name: p.name ?? p.id,

@@ -123,6 +123,7 @@ export const DEFAULT_ROUTES = {
  */
 export const DEFAULT_PROVIDERS = {
   $schemaVersion: 1,
+  visionModelId: '',
   providers: [],
 };
 

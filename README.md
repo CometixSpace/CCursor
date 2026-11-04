@@ -50,7 +50,8 @@ npx @cometix/ccursor status
 - **Error Banner** — LLM errors surface as Cursor's native retry banner with retryable/non-retryable classification
 - **Per-Window Logging** — Each window gets its own log stream, colored output in LogOutputChannel
 - **Hot-Reload** — Config changes take effect without restarting Cursor
-- **22 Agent Tools** — Shell, Read, Grep, Glob, StrReplace, Write, Task, MCP, etc.
+- **Vision Model Routing** — When the main model cannot read images, image-bearing rounds automatically use a configured multimodal model and text-only rounds return to the main model
+- **22 Agent Tools** — Shell, Read, Grep, Glob, Edit, Write, Task, MCP, etc.
 - **Hub Integration** — Device authorization via LinuxDO Connect
 
 ---
@@ -66,7 +67,7 @@ Cursor IDE
   ├─ always-local-patch (extension host)
   │   └─ rewrite http/https.request + hot-reload from routes.json
   │
-  └─ Cursor++ Extension (BYOK Server @ 127.0.0.1:9960)
+  └─ Cursor++ Extension (BYOK Server @ 127.0.0.1:39831)
       ├─ Fastify + ConnectRPC (27 services)
       ├─ LLM: Anthropic / OpenAI / Gemini SDK
       ├─ Agent: multi-round tool-calling orchestrator
@@ -83,7 +84,7 @@ Config files are stored in `~/.ccursor/`:
 
 | File | Purpose |
 |---|---|
-| `providers.json` | LLM provider endpoints, API keys, and model definitions |
+| `providers.json` | LLM provider endpoints, API keys, model definitions, and optional vision routing |
 | `routes.json` | BYOK mode toggle + redirect whitelist |
 | `cursor.db` | Conversation persistence (SQLite) |
 
@@ -91,6 +92,7 @@ Config files are stored in `~/.ccursor/`:
 
 ```json
 {
+  "visionModelId": "my-vision-model",
   "providers": [
     {
       "id": "my-anthropic",
@@ -113,6 +115,16 @@ Config files are stored in `~/.ccursor/`:
   ]
 }
 ```
+
+### Vision Model Routing
+
+1. Mark a text-only model with `"supportsImages": false`.
+2. Mark the fallback model with `"supportsImages": true` and `"supportsAgent": true`.
+3. Select it in the Cursor++ sidebar under **Vision Routing**, or set the top-level `visionModelId` in `providers.json`.
+
+When a user attaches an image, reads an image file, or an MCP/browser screenshot tool returns image content, only that image-bearing Agent round uses the vision model. The next text-only round automatically returns to the selected main model. Historical image bytes are omitted before returning to a text-only model, while the vision model's textual analysis remains in the conversation.
+
+If the main model does not support images and no valid vision model is configured, Cursor++ shows a non-retryable configuration error instead of silently discarding the image.
 
 ---
 

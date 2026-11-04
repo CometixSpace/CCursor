@@ -69,8 +69,11 @@ npx @cometix/ccursor status
 - **Hot-Reload** — Config changes take effect without restarting Cursor  
   **热重载** — 配置修改无需重启 Cursor 即可生效
 
-- **22 Agent Tools** — Shell, Read, Grep, Glob, StrReplace, Write, Task, MCP, etc.  
-  **22 个 Agent 工具** — Shell、Read、Grep、Glob、StrReplace、Write、Task、MCP 等
+- **Vision Model Routing** — Image-bearing rounds automatically use a configured multimodal model when the main model cannot read images<br/>
+  **看图模型路由** — 主模型不支持图片时，含图片的轮次自动使用指定多模态模型，纯文字轮次自动切回主模型
+
+- **22 Agent Tools** — Shell, Read, Grep, Glob, Edit, Write, Task, MCP, etc.<br/>
+  **22 个 Agent 工具** — Shell、Read、Grep、Glob、Edit、Write、Task、MCP 等
 
 - **Hub Integration** — Device authorization via LinuxDO Connect  
   **Hub 集成** — 通过 LinuxDO Connect 设备授权
@@ -88,7 +91,7 @@ Cursor IDE
   ├─ always-local-patch (extension host)
   │   └─ rewrite http/https.request + hot-reload from routes.json
   │
-  └─ Cursor++ Extension (BYOK Server @ 127.0.0.1:9960)
+  └─ Cursor++ Extension (BYOK Server @ 127.0.0.1:39831)
       ├─ Fastify + ConnectRPC (27 services)
       ├─ LLM: Anthropic / OpenAI / Gemini SDK
       ├─ Agent: multi-round tool-calling orchestrator
@@ -106,7 +109,7 @@ Config files in `~/.ccursor/`:
 
 | File | Purpose / 用途 |
 |---|---|
-| `providers.json` | LLM providers, API keys, models / 服务商、密钥、模型定义 |
+| `providers.json` | LLM providers, API keys, models, vision routing / 服务商、密钥、模型定义、看图模型路由 |
 | `routes.json` | BYOK toggle + redirect whitelist / BYOK 开关 + 重定向白名单 |
 | `cursor.db` | Conversation persistence / 对话持久化 |
 
@@ -114,6 +117,7 @@ Config files in `~/.ccursor/`:
 
 ```json
 {
+  "visionModelId": "my-vision-model",
   "providers": [
     {
       "id": "my-anthropic",
@@ -136,6 +140,16 @@ Config files in `~/.ccursor/`:
   ]
 }
 ```
+
+### Vision Model Routing / 看图模型路由
+
+1. 将不支持图片的主模型配置为 `"supportsImages": false`。
+2. 将备用看图模型配置为 `"supportsImages": true` 和 `"supportsAgent": true`。
+3. 在 Cursor++ 侧边栏的 **Vision Routing** 中选择该模型，或者在 `providers.json` 顶层填写 `visionModelId`。
+
+当用户加入图片、Agent 读取图片文件，或 MCP/浏览器截图工具返回图片时，只有包含新图片的 Agent 轮次会临时使用看图模型。下一轮没有新图片时自动切回主模型。切回不支持图片的模型前，历史图片二进制数据会替换成文字占位，但看图模型已经生成的文字分析会继续保留在对话里。
+
+如果主模型不支持图片，并且没有配置有效的看图模型，Cursor++ 会显示不可重试的配置错误，不会静默忽略图片。
 
 ---
 

@@ -219,6 +219,20 @@ export function makeModelNotFoundError(modelId: string): ConnectError {
   })
 }
 
+/** 当前轮包含图片，但没有可用的多模态 Agent 模型。 */
+export function makeVisionModelConfigurationError(
+  detail: string,
+  additionalInfo: Record<string, string> = {},
+): ConnectError {
+  return makeByokConnectError({
+    errorCode: ErrorDetails_Error.BAD_MODEL_NAME,
+    title: 'Vision model is not configured',
+    detail,
+    isRetryable: false,
+    additionalInfo,
+  })
+}
+
 // ── 内部 helper ────────────────────────────────────────────────
 
 function extractErrorMessage(e: unknown): string {

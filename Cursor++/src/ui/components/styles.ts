@@ -93,6 +93,12 @@ export const styles = /* css */ `
   .byok-banner button.off { background: var(--vscode-statusBarItem-warningBackground, #cc6633); color: var(--vscode-statusBarItem-warningForeground, #fff); }
   .server-row { display: flex; align-items: center; justify-content: space-between; padding: 4px 0; font-size: 12px; }
 
+  .vision-routing { padding: 4px 0 2px; }
+  .vision-routing-copy { margin-bottom: 6px; }
+  .vision-routing-title { font-size: 12px; font-weight: 600; }
+  .vision-routing-hint { margin-top: 2px; color: var(--vscode-descriptionForeground); font-size: 10px; line-height: 1.4; }
+  .vision-routing-warning { margin-top: 5px; color: var(--vscode-inputValidation-warningForeground, var(--vscode-editorWarning-foreground)); font-size: 10px; line-height: 1.4; }
+
   .acc { border: 1px solid var(--vscode-widget-border, var(--vscode-editorWidget-border)); border-radius: 3px; margin-bottom: 6px; background: var(--vscode-editor-background); }
   .acc.dirty { border-color: var(--vscode-inputValidation-warningBorder, #cca700); }
   .acc-head { display: flex; align-items: center; gap: 6px; padding: 6px 8px; cursor: pointer; user-select: none; }

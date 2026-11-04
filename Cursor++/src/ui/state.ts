@@ -26,6 +26,7 @@ export interface AppState {
   host: string
   port: number
   byokMode: ByokMode
+  visionModelId: string
   providers: ProviderEntry[]
   webTools: import('../server/data/defaults').WebToolsConfig
   version: string
@@ -44,6 +45,7 @@ let current: AppState = {
   port: 39831,
   byokMode: 1,
   version: EXTENSION_VERSION,
+  visionModelId: '',
   providers: [],
   webTools: { $schemaVersion: 1, search: { providers: [], parallel: false, maxResults: 5 }, fetch: { provider: 'builtin' } },
   fileLogEnabled: false,
@@ -132,7 +134,8 @@ export async function refreshState(_secrets?: vscode.SecretStorage): Promise<App
   }
 
   const byokMode = getByokMode()
-  const providers = loadProviders().providers
+  const providersConfig = loadProviders()
+  const providers = providersConfig.providers
 
   current = {
     server,
@@ -141,6 +144,7 @@ export async function refreshState(_secrets?: vscode.SecretStorage): Promise<App
     host: cfg.host,
     port: cfg.port,
     byokMode,
+    visionModelId: providersConfig.visionModelId ?? '',
     providers,
     webTools: getWebTools(),
     version: EXTENSION_VERSION,
