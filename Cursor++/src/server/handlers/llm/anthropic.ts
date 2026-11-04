@@ -89,6 +89,13 @@ export class AnthropicProvider implements LLMProvider {
             stream: true,
         };
 
+        // 会话亲和: 透传 conversationId 至 metadata.user_id, 供下游网关做
+        // 会话级粘性路由 (session affinity)。官方客户端 Claude Code 同样在该
+        // 字段中携带 session 维度; 缺省时不注入, 保持请求体不变。
+        if (request.conversationId) {
+            params.metadata = { user_id: request.conversationId };
+        }
+
         if (cached.system) {
             params.system = cached.system;
         }
