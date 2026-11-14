@@ -12,7 +12,7 @@ import {
 } from './constants';
 import type { LLMMessage } from '../llm/types';
 import type { HistoryEntry } from './historyManager';
-import { isPreambleUserMessage, isSummaryBlobMessage } from './historyManager';
+import { isPreambleUserMessage } from './historyManager';
 
 export interface CompactionPlan {
     leading: HistoryEntry[];
@@ -170,8 +170,8 @@ export function planCompaction(entries: HistoryEntry[], contextTokenLimit = 0): 
     const summarizeEntries = body.slice(0, summarizeCount);
     const replacedEntries = summarizeEntries.filter(entry => !pinned.includes(entry));
 
-    // 被取代的一条也没有 (待摘要的只有钉在 tail 里的那条指令) 时没有东西可压。
-    if (replacedEntries.length === 0)
+    // 被取代的只有上一次压缩留下的摘要 (或者什么都没有) 时没有东西可压: 再调一次模型只会得到摘要的摘要。
+    if (replacedEntries.every(isSummaryEntry))
         return { leading, summarizeEntries: [], replacedEntries: [], keepTail: body };
 
     return { leading, summarizeEntries, replacedEntries, keepTail: [...pinned, ...body.slice(summarizeCount)] };
@@ -182,6 +182,14 @@ function isUserInstruction(entry: HistoryEntry): boolean {
     const { role, content } = entry.message;
     return role === 'user'
         && (typeof content === 'string' ? content.trim().length > 0 : content.some(block => block.type === 'text'));
+}
+
+/** 摘要消息的固定开头。历史重新编码后 providerOptions 上的 isSummary 标记会丢, 只有内容还认得出来。 */
+const SUMMARY_MESSAGE_PREFIX = 'Previous conversation summary:\n';
+
+function isSummaryEntry(entry: HistoryEntry): boolean {
+    const { role, content } = entry.message;
+    return role === 'assistant' && typeof content === 'string' && content.startsWith(SUMMARY_MESSAGE_PREFIX);
 }
 
 function encodeBinaryBlob(bytes: Uint8Array): { blobId: string; blobData: string; blobDataRaw: Uint8Array } {
@@ -197,14 +205,14 @@ export function createCompactionArtifacts(params: {
 }): CompactionArtifacts {
     const summaryBlob = encodeBlob({
         role: 'assistant',
-        content: `Previous conversation summary:\n${params.summaryText}`,
+        content: `${SUMMARY_MESSAGE_PREFIX}${params.summaryText}`,
         providerOptions: { cursor: { isSummary: true } },
     });
     cacheBlob(summaryBlob.blobId, summaryBlob.blobData);
 
     // 归档记的是被摘要取代的消息, 上一次压缩留下的摘要不算
     const archiveSourceBlobIds = params.plan.replacedEntries
-        .filter(entry => !isSummaryBlobMessage(entry.raw))
+        .filter(entry => !isSummaryEntry(entry))
         .map(entry => entry.blobId);
 
     const archiveBlobs: Array<{ blobId: string; blobData: string; blobDataRaw?: Uint8Array }> = [];

@@ -183,3 +183,45 @@ it('planCompaction leaves an instruction that alone exceeds the tail budget to t
   expect(plan.keepTail.some(entry => entry.message.role === 'user')).toBe(false)
   expect(plan.summarizeEntries[0]?.message.role).toBe('user')
 })
+
+it('planCompaction has nothing to summarize when only the previous summary precedes the tail', () => {
+  const plan = planCompaction(toEntries([
+    { role: 'system', content: 'sys prompt' },
+    { role: 'assistant', content: 'Previous conversation summary:\n- earlier work' },
+    { role: 'user', content: 'user-2' },
+    { role: 'assistant', content: 'assistant-2' },
+  ]))
+
+  expect(plan.summarizeEntries).toEqual([])
+  expect(plan.keepTail).toHaveLength(3)
+})
+
+it('planCompaction has nothing to summarize when the summary would replace nothing but the previous summary', () => {
+  const plan = planCompaction(toEntries([
+    { role: 'system', content: 'sys prompt' },
+    { role: 'assistant', content: 'Previous conversation summary:\n- earlier work' },
+    { role: 'user', content: 'user-2' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'call_0', name: 'Read', input: { path: '0.ts' } }] },
+    { role: 'tool', content: 'file body', toolCallId: 'call_0', toolName: 'Read' },
+  ]))
+
+  // 指令原文留在 tail 里, 被取代的只有旧摘要: 压了就是摘要的摘要
+  expect(plan.summarizeEntries).toEqual([])
+  expect(plan.keepTail).toHaveLength(4)
+})
+
+it('createCompactionArtifacts archives the messages a second summary replaces, but not the first summary', () => {
+  const entries = toEntries([
+    { role: 'system', content: 'sys prompt' },
+    { role: 'assistant', content: 'Previous conversation summary:\n- earlier work' },
+    { role: 'user', content: 'user-2' },
+    { role: 'assistant', content: 'assistant-2' },
+    { role: 'user', content: 'user-3' },
+    { role: 'assistant', content: 'assistant-3' },
+  ])
+
+  const artifacts = createCompactionArtifacts({ plan: planCompaction(entries), summaryText: '- all of it', previousSummaryArchiveIds: [] })
+
+  const archive = fromBinary(ConversationSummaryArchiveSchema, artifacts.archiveBlobs[0]!.blobDataRaw!)
+  expect(archive.summarizedMessages.map(blobId => new TextDecoder().decode(blobId))).toEqual([entries[2]!.blobId, entries[3]!.blobId])
+})
