@@ -71,6 +71,8 @@ const AUTOCOMPACT_BUFFER_TOKENS = 20_000
 const MAX_OUTPUT_RESERVE = 20_000
 
 export function getAutoCompactThreshold(maxTokens: number, maxOutputTokens = 8192): number {
+    // 模型没配 contextTokenLimit 时窗口大小是 0: 无从判断占用, 不能让阈值算成负数而每轮必压
+    if (!(maxTokens > 0)) return Infinity
     const outputReserve = Math.min(maxOutputTokens, MAX_OUTPUT_RESERVE)
     const effective = maxTokens - outputReserve
     return effective - AUTOCOMPACT_BUFFER_TOKENS

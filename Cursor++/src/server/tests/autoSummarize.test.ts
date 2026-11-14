@@ -94,6 +94,11 @@ it('getAutoCompactThreshold caps output reserve at 20K', () => {
   expect(getAutoCompactThreshold(1000000, 32000)).toBe(960000)
 })
 
+it('auto compaction never triggers while the context window size is unknown', () => {
+  // providers.json 里没配 contextTokenLimit 的模型, 窗口大小一路传下来是 0
+  expect(getAutoCompactThreshold(0)).toBe(Infinity)
+})
+
 // ─── clampTokenDetails tests ───
 
 it('clampTokenDetails clamps to valid range', () => {
