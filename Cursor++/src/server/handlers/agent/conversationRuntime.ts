@@ -531,7 +531,7 @@ async function* performInlineAutoSummarize(params: {
   if (historyEntries.length === 0)
     return null
 
-  const compactionPlan = planCompaction(historyEntries)
+  const compactionPlan = planCompaction(historyEntries, contextTokenLimit)
   if (compactionPlan.summarizeEntries.length === 0) {
     logger.info({ conversationId: parsed.conversationId }, '[AGENT] auto-summarize: nothing to compact')
     return null

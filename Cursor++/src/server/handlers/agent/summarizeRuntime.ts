@@ -20,11 +20,14 @@ export async function* handleSummarizeAction(
     const hydratedHistoryEntries = hydrateHistoryEntries(parsed.historyBlobIds);
     const missingHistoryBlobs = Math.max(0, parsed.historyBlobIds.length - hydratedHistoryEntries.length);
     const historyEntries = repairHistoryEntries(hydratedHistoryEntries);
-    const compactionPlan = planCompaction(historyEntries);
     const currentTokenDetails = clampTokenDetails(
         parsed.historyTokenDetails?.usedTokens ?? estimateMessagesTokens(historyEntries.map(entry => entry.message)),
         parsed.historyTokenDetails?.maxTokens ?? parsed.contextTokenLimit ?? route.contextTokenLimit,
     );
+    // 压缩策略看的窗口大小与 run 路径同源, 0 表示未知。currentTokenDetails.maxTokens 是给客户端
+    // 显示用的, 已被钳到至少 1, 拿它做判断会把 "未知" 当成 "只有 1 个 token 的窗口"。
+    const contextTokenLimit = parsed.contextTokenLimit ?? route.contextTokenLimit;
+    const compactionPlan = planCompaction(historyEntries, contextTokenLimit);
     const contextUsagePercent = computeContextUsagePercent(currentTokenDetails.usedTokens, currentTokenDetails.maxTokens);
     const generationId = randomUUID();
 

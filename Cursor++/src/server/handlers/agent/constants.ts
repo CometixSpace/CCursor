@@ -47,3 +47,5 @@ export const COMPACTION_MEDIUM_BODY_THRESHOLD = 2;
 export const COMPACTION_MEDIUM_BODY_KEEP_TAIL = 2;
 export const COMPACTION_LONG_BODY_THRESHOLD = 8;
 export const COMPACTION_LONG_BODY_KEEP_TAIL = 6;
+// 条数之外再给 tail 一个体积上限 (占上下文窗口的比例), 压缩后才有余量再跑若干轮。
+export const COMPACTION_TAIL_BUDGET_RATIO = 0.25;

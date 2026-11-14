@@ -160,3 +160,26 @@ it('planCompaction does not keep an already answered question when nothing follo
   expect(plan.summarizeEntries.map(entry => entry.message.content)).toEqual(['user-1', 'assistant-1'])
   expect(plan.keepTail).toEqual([])
 })
+
+it('planCompaction trims an oversized tail to the token budget but always keeps the last round', () => {
+  // 每个结果约 40K token, 128K 窗口的 tail 预算只有 32K: 一轮都装不下, 最后一轮照样留着
+  const plan = planCompaction(buildToolChainEntries(12, 160_000), 128_000)
+
+  expect(plan.keepTail.map(entry => entry.message.role)).toEqual(['user', 'assistant', 'tool'])
+  expect(plan.keepTail[2]?.message.toolCallId).toBe('call_11')
+})
+
+it('planCompaction counts the instruction it keeps verbatim against the tail budget', () => {
+  // 每轮约 8K token, 3.2 万的预算本来留得下 3 轮; 约 1 万 token 的指令占掉其中一轮的位置
+  const plan = planCompaction(buildToolChainEntries(20, 32_000, 'x'.repeat(40_000)), 128_000)
+
+  expect(plan.keepTail.map(entry => entry.message.role)).toEqual(['user', 'assistant', 'tool', 'assistant', 'tool'])
+})
+
+it('planCompaction leaves an instruction that alone exceeds the tail budget to the summary', () => {
+  // 约 5 万 token 的指令, 128K 窗口的尾窗预算是 3.2 万: 原文留着的话它永远压不掉
+  const plan = planCompaction(buildToolChainEntries(20, 100, 'x'.repeat(200_000)), 128_000)
+
+  expect(plan.keepTail.some(entry => entry.message.role === 'user')).toBe(false)
+  expect(plan.summarizeEntries[0]?.message.role).toBe('user')
+})

@@ -8,6 +8,7 @@ import {
     COMPACTION_LONG_BODY_THRESHOLD,
     COMPACTION_MEDIUM_BODY_KEEP_TAIL,
     COMPACTION_MEDIUM_BODY_THRESHOLD,
+    COMPACTION_TAIL_BUDGET_RATIO,
 } from './constants';
 import type { LLMMessage } from '../llm/types';
 import type { HistoryEntry } from './historyManager';
@@ -96,7 +97,24 @@ export function estimateMessagesTokens(messages: Array<LLMMessage | { role: stri
     return messages.reduce((sum, message) => sum + estimateTextTokens(typeof message.content === 'string' ? message.content : formatMessageForSummary(message as LLMMessage)), 0);
 }
 
-export function planCompaction(entries: HistoryEntry[]): CompactionPlan {
+function estimateEntriesTokens(entries: HistoryEntry[]): number {
+    return estimateMessagesTokens(entries.map(entry => entry.message));
+}
+
+/**
+ * tail (body 从 start 起的部分) 超出 budget 时, 把最旧的一轮 —— 一条非 tool 消息连同紧跟它的
+ * tool 结果 —— 整轮让给摘要, 直到装得下。最后一轮始终保留, 模型续写要用。返回 tail 新的起点。
+ */
+function fitTailToBudget(body: HistoryEntry[], start: number, budget: number): number {
+    while (estimateEntriesTokens(body.slice(start)) > budget) {
+        const nextRound = body.findIndex((entry, i) => i > start && entry.message.role !== 'tool');
+        if (nextRound < 0) break;
+        start = nextRound;
+    }
+    return start;
+}
+
+export function planCompaction(entries: HistoryEntry[], contextTokenLimit = 0): CompactionPlan {
     const leading: HistoryEntry[] = [];
     let index = 0;
 
@@ -134,14 +152,20 @@ export function planCompaction(entries: HistoryEntry[]): CompactionPlan {
     while (body[summarizeCount]?.message.role === 'tool' && summarizeCount > 0)
         summarizeCount--;
 
+    // 条数挡不住体积: 几条巨型工具结果就能让 tail 贴着触发线, 压完下一轮又触发。
+    const tailBudget = contextTokenLimit > 0 ? contextTokenLimit * COMPACTION_TAIL_BUDGET_RATIO : Infinity;
+    summarizeCount = fitTailToBudget(body, summarizeCount, tailBudget);
+
     // 用户的指令要有原文留在压缩后的历史里: 摘要是转述, 可能走样 (官方客户端的切分同样会回溯保留它)。
     // 长工具链里本轮的指令早已落在摘要一侧 —— tail 里有内容却没有用户消息时, 把最后一条指令的原文钉在
-    // tail 开头。摘要一侧照样有它: 摘要要对着任务来写。tail 是空的就不钉: 那条指令已经答完了。
+    // tail 开头, 它占的体积从 tail 的预算里出。摘要一侧照样有它: 摘要要对着任务来写。
+    // 指令自己就超出预算的只靠摘要转述, 否则它永远压不掉。tail 是空的就不钉: 那条指令已经答完了。
     const tail = body.slice(summarizeCount);
     const lastInstruction = tail.length === 0 || tail.some(isUserInstruction)
         ? undefined
         : body.slice(0, summarizeCount).filter(isUserInstruction).at(-1);
-    const pinned = lastInstruction ? [lastInstruction] : [];
+    const pinned = lastInstruction && estimateEntriesTokens([lastInstruction]) <= tailBudget ? [lastInstruction] : [];
+    summarizeCount = fitTailToBudget(body, summarizeCount, tailBudget - estimateEntriesTokens(pinned));
 
     const summarizeEntries = body.slice(0, summarizeCount);
     const replacedEntries = summarizeEntries.filter(entry => !pinned.includes(entry));
