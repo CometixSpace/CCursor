@@ -77,10 +77,3 @@ export function getAutoCompactThreshold(maxTokens: number, maxOutputTokens = 819
     const effective = maxTokens - outputReserve
     return effective - AUTOCOMPACT_BUFFER_TOKENS
 }
-
-export function shouldTriggerCompaction(usedTokens: number, maxTokens: number, thresholdPercent?: number): boolean {
-    if (thresholdPercent !== undefined) {
-        return computeContextUsagePercent(usedTokens, maxTokens) >= thresholdPercent;
-    }
-    return usedTokens >= getAutoCompactThreshold(maxTokens);
-}

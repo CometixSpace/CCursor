@@ -9,7 +9,7 @@ import { encodeBlob } from '../handlers/agent/blob'
 import { cacheBlob, resetBlobCacheForTests } from '../handlers/agent/blobStore'
 import { createCompactionArtifacts, estimateMessagesTokens, formatMessageForSummary, planCompaction } from '../handlers/agent/compactionStrategy'
 import { hydrateHistoryEntries, isSummaryBlobMessage } from '../handlers/agent/historyManager'
-import { clampTokenDetails, computeContextUsagePercent, getAutoCompactThreshold, shouldTriggerCompaction } from '../handlers/agent/usage'
+import { clampTokenDetails, computeContextUsagePercent, getAutoCompactThreshold } from '../handlers/agent/usage'
 
 // ─── helpers ───
 
@@ -65,26 +65,13 @@ afterEach(async () => {
   }
 })
 
-// ─── shouldTriggerCompaction tests ───
+// ─── getAutoCompactThreshold tests ───
 
-it('shouldTriggerCompaction returns false below threshold', () => {
-  expect(shouldTriggerCompaction(80000, 100000, 85)).toBe(false)
-  expect(shouldTriggerCompaction(84000, 100000, 85)).toBe(false)
-})
-
-it('shouldTriggerCompaction returns true at/above threshold', () => {
-  expect(shouldTriggerCompaction(85000, 100000, 85)).toBe(true)
-  expect(shouldTriggerCompaction(90000, 100000, 85)).toBe(true)
-  expect(shouldTriggerCompaction(100000, 100000, 85)).toBe(true)
-})
-
-it('shouldTriggerCompaction default uses absolute buffer threshold', () => {
+it('getAutoCompactThreshold uses absolute buffer threshold', () => {
   // 绝对 buffer 模式 (对齐 Claude Code):
   //   threshold = maxTokens - min(maxOutputTokens, 20K outputReserve) - 20K buffer
   // 默认 maxOutputTokens=8192 → 100K 模型 threshold = 100000 - 8192 - 20000 = 71808
   expect(getAutoCompactThreshold(100000)).toBe(71808)
-  expect(shouldTriggerCompaction(71807, 100000)).toBe(false)
-  expect(shouldTriggerCompaction(71808, 100000)).toBe(true)
 })
 
 it('getAutoCompactThreshold caps output reserve at 20K', () => {
@@ -311,20 +298,4 @@ it('end-to-end: compaction reduces blob count and token estimate', () => {
   const summaryEntry = hydrated.find(e => isSummaryBlobMessage(e.raw))
   expect(summaryEntry, 'should have a summary blob in compacted history').toBeTruthy()
   expect(summaryEntry!.message.content as string).toMatch(/Previous conversation summary/)
-})
-
-it('end-to-end: shouldTriggerCompaction integrates with token estimation', () => {
-  // Simulate a conversation that's approaching context limit
-  const contextLimit = 8000
-  const entries = makeHistoryEntries(30, { withSystem: true })
-  const estimate = estimateMessagesTokens(entries.map(e => e.message))
-
-  // With a 30-message conversation and ~125+ chars each, estimate should be substantial
-  expect(estimate > 0, `token estimate should be positive: ${estimate}`).toBeTruthy()
-
-  // Test with tight limit to simulate pressure
-  const shouldCompact = shouldTriggerCompaction(estimate, contextLimit, 85)
-  if (estimate >= contextLimit * 0.85) {
-    expect(shouldCompact, 'should trigger compaction when over 85%').toBe(true)
-  }
 })
