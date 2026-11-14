@@ -89,8 +89,19 @@ export function formatMessageForSummary(message: LLMMessage): string {
     return text ? `${message.role}:\n${text}` : '';
 }
 
+/** U+2E80 起是中日韩文字 (及其后的全角符号、谚文等) 所在的区段 */
+const CJK_START = 0x2E80;
+
+/**
+ * 拉丁文字和代码大约 4 个字符一个 token; 中日韩文字大约一个字一个 token,
+ * 一律按 ÷4 会把中文低估到实际的三分之一。
+ */
 export function estimateTextTokens(text: string): number {
-    return Math.max(1, Math.ceil(text.length / 4));
+    let wideChars = 0;
+    for (let i = 0; i < text.length; i++) {
+        if (text.charCodeAt(i) >= CJK_START) wideChars++;
+    }
+    return Math.max(1, Math.ceil(wideChars + (text.length - wideChars) / 4));
 }
 
 export function estimateMessagesTokens(messages: Array<LLMMessage | { role: string; content: string }>): number {

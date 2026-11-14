@@ -265,6 +265,12 @@ it('estimateMessagesTokens provides reasonable estimates', () => {
   expect(estimate <= 400, `expected <= 400, got ${estimate}`).toBeTruthy()
 })
 
+it('estimateMessagesTokens counts CJK text at about one token per character', () => {
+  expect(estimateMessagesTokens([{ role: 'user', content: 'a'.repeat(400) }])).toBe(100)
+  expect(estimateMessagesTokens([{ role: 'user', content: '压'.repeat(400) }])).toBe(400)
+  expect(estimateMessagesTokens([{ role: 'user', content: '压缩'.repeat(100) + 'a'.repeat(400) }])).toBe(300)
+})
+
 // ─── End-to-end compaction flow test ───
 
 it('end-to-end: compaction reduces blob count and token estimate', () => {
