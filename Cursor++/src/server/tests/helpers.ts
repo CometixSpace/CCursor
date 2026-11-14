@@ -1,3 +1,4 @@
+import type { AgentServerMessage } from '../gen/agent_v1_pb'
 import { unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -43,4 +44,10 @@ export function longHistory(): string[] {
     cacheMessage('system', 'sys prompt'),
     ...Array.from({ length: 10 }, (_, i) => cacheMessage(i % 2 ? 'assistant' : 'user', `message ${i}: ${'x'.repeat(2_000)}`)),
   ]
+}
+
+/** 帧的种类; interactionUpdate 取它里面那一层 */
+export function frameKind(frame: AgentServerMessage): string {
+  const { message } = frame
+  return (message.case === 'interactionUpdate' ? message.value.message.case : message.case) ?? ''
 }
