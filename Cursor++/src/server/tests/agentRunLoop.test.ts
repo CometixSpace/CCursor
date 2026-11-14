@@ -82,3 +82,39 @@ it('reserves the model\'s real output limit when deciding to compact', async () 
   expect(withDefaultOutput.compactedAfter).toEqual([])
   expect(withLargeOutput.compactedAfter).toEqual([2])
 })
+
+it('counts the tool results of the current round on top of the usage the model reported', async () => {
+  // 第二轮模型上报占用 150K, 离 171,808 的触发线还差两万多。这一轮 30 个工具结果各约 1K token ——
+  // 而全部消息的估算远小于 150K, 只取两者较大值的话占用纹丝不动, 不会触发。
+  const calls = Array.from({ length: 30 }, (_, i): ToolCall => ({
+    id: `call_${i}`,
+    name: 'TodoWrite',
+    input: { merge: false, todos: [{ id: String(i), content: 'x'.repeat(5_000), status: 'pending' }] },
+  }))
+
+  const { compactedAfter } = await run('default-output', (attempt) => {
+    if (attempt === 1)
+      return callTools(1_000, todoWrite('call_first'))
+    return attempt === 2 ? callTools(150_000, ...calls) : reply('done')
+  })
+
+  expect(compactedAfter).toEqual([2])
+})
+
+it('lets the usage the model reports bring an inflated estimate back down', async () => {
+  // 第一轮上报 100K, 60 个工具结果各约 1K token 叠上去, 估算到了 160K。第二轮模型上报 110K ——
+  // 以它为准再叠 15 个结果是 125K, 不触线; 只增不减的话是 160K 再叠 15K, 越过 171,808。
+  const calls = (count: number) => Array.from({ length: count }, (_, i): ToolCall => ({
+    id: `call_${count}_${i}`,
+    name: 'TodoWrite',
+    input: { merge: false, todos: [{ id: String(i), content: 'x'.repeat(4_100), status: 'pending' }] },
+  }))
+
+  const { compactedAfter } = await run('default-output', (attempt) => {
+    if (attempt === 1)
+      return callTools(100_000, ...calls(60))
+    return attempt === 2 ? callTools(110_000, ...calls(15)) : reply('done')
+  })
+
+  expect(compactedAfter).toEqual([])
+})
