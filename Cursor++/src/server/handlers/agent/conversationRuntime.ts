@@ -22,7 +22,7 @@ import { restoreBlobMessageToLLMMessage } from './transcript'
 import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, readTurnBaseline } from './turnTracker'
 import { contextualizeDynamicMetaTools, partitionCursorBuiltinTools, shouldEnableBuiltinDynamicProfile } from './dynamicTools'
 import { contextualizeSubagentTools } from './subagentCatalog'
-import { addUsage, clampTokenDetails, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold, shouldTriggerCompaction } from './usage'
+import { addUsage, clampTokenDetails, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold } from './usage'
 import { isAgentRunAbortedError, throwIfSessionCancelled } from './wait'
 import { isSessionCancelled } from './session'
 import { makeProviderError, makeToolError } from '../errors'
@@ -1377,14 +1377,16 @@ export async function* handleConversationRun(
       // 链路①: 服务端 Agent Run 内自动 summarize
       // 每轮都检查——超阈值就触发 compaction,可重复触发,连续失败 3 次才熔断
       // (对齐 Claude Code autoCompactIfNeeded 的 consecutiveFailures 熔断机制)
+      // 输出预留按模型实际的 maxOutputTokens 算: 它会原样作为 max_tokens 发给 provider
+      const autoCompactThreshold = getAutoCompactThreshold(contextTokenLimit, route.maxOutputTokens)
       if (autoCompactConsecutiveFailures < MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES
-        && shouldTriggerCompaction(usedTokensEstimate, contextTokenLimit)) {
+        && usedTokensEstimate >= autoCompactThreshold) {
         logger.info({
           conversationId: parsed.conversationId,
           round,
           usedTokensEstimate,
           contextTokenLimit,
-          threshold: getAutoCompactThreshold(contextTokenLimit),
+          threshold: autoCompactThreshold,
           consecutiveFailures: autoCompactConsecutiveFailures,
         }, '[AGENT] auto-summarize: threshold exceeded, triggering inline compaction')
 
