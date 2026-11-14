@@ -15,7 +15,11 @@ import { isPreambleUserMessage, isSummaryBlobMessage } from './historyManager';
 
 export interface CompactionPlan {
     leading: HistoryEntry[];
+    /** 交给模型写成摘要的部分 */
     summarizeEntries: HistoryEntry[];
+    /** 其中被摘要取代的那些。钉在 tail 开头的用户指令两边都在, 不算 (见 planCompaction) */
+    replacedEntries: HistoryEntry[];
+    /** 摘要之后原样保留的部分 */
     keepTail: HistoryEntry[];
 }
 
@@ -125,36 +129,35 @@ export function planCompaction(entries: HistoryEntry[]): CompactionPlan {
     // 如果 keepTail 以 tool role 开头, 其配对的 assistant(tool_use) 在 summarize 侧,
     // 发给 OpenAI 时报 "No tool call found for function call output"。
     //
-    // 同理, 如果 keepTail 以 assistant(含 tool_use) 开头, 但下一条 tool(result)
-    // 被切到 summarize 侧, assistant 的 tool_use 就没有配对结果。
-    //
-    // 修复: 向前扩展 keepTail 到最近的安全边界 (user 或无 tool_use 的 assistant)。
-    while (summarizeCount > 0) {
-        const first = body[summarizeCount];
-        if (!first) break;
-        // keepTail 首条是 tool result → 配对的 tool_call 在 summarize 侧
-        if (first.message.role === 'tool') {
-            summarizeCount--;
-            continue;
-        }
-        // keepTail 首条是 assistant 且含 tool_use → 下面的 tool result 可能被切走
-        if (first.message.role === 'assistant' && hasToolUse(first.message)) {
-            summarizeCount--;
-            continue;
-        }
-        break;
-    }
+    // 退到所属的 assistant 即止: 它的 tool results 都排在它后面, 已经在 tail 里。
+    // 再往前退会把更早的工具轮次逐个拉回 tail, 长工具链里一条也压不掉。
+    while (body[summarizeCount]?.message.role === 'tool' && summarizeCount > 0)
+        summarizeCount--;
 
-    return {
-        leading,
-        summarizeEntries: body.slice(0, summarizeCount),
-        keepTail: body.slice(summarizeCount),
-    };
+    // 用户的指令要有原文留在压缩后的历史里: 摘要是转述, 可能走样 (官方客户端的切分同样会回溯保留它)。
+    // 长工具链里本轮的指令早已落在摘要一侧 —— tail 里有内容却没有用户消息时, 把最后一条指令的原文钉在
+    // tail 开头。摘要一侧照样有它: 摘要要对着任务来写。tail 是空的就不钉: 那条指令已经答完了。
+    const tail = body.slice(summarizeCount);
+    const lastInstruction = tail.length === 0 || tail.some(isUserInstruction)
+        ? undefined
+        : body.slice(0, summarizeCount).filter(isUserInstruction).at(-1);
+    const pinned = lastInstruction ? [lastInstruction] : [];
+
+    const summarizeEntries = body.slice(0, summarizeCount);
+    const replacedEntries = summarizeEntries.filter(entry => !pinned.includes(entry));
+
+    // 被取代的一条也没有 (待摘要的只有钉在 tail 里的那条指令) 时没有东西可压。
+    if (replacedEntries.length === 0)
+        return { leading, summarizeEntries: [], replacedEntries: [], keepTail: body };
+
+    return { leading, summarizeEntries, replacedEntries, keepTail: [...pinned, ...body.slice(summarizeCount)] };
 }
 
-function hasToolUse(message: LLMMessage): boolean {
-    if (typeof message.content === 'string') return false;
-    return message.content.some(b => b.type === 'tool_use');
+/** 用户自己写的消息 —— 不算 tool_result 的载体, 也不算只带图片的附件消息。只看形态: 历史修复把落单的工具结果改写成的 user 文本也算。 */
+function isUserInstruction(entry: HistoryEntry): boolean {
+    const { role, content } = entry.message;
+    return role === 'user'
+        && (typeof content === 'string' ? content.trim().length > 0 : content.some(block => block.type === 'text'));
 }
 
 function encodeBinaryBlob(bytes: Uint8Array): { blobId: string; blobData: string; blobDataRaw: Uint8Array } {
@@ -175,7 +178,8 @@ export function createCompactionArtifacts(params: {
     });
     cacheBlob(summaryBlob.blobId, summaryBlob.blobData);
 
-    const archiveSourceBlobIds = params.plan.summarizeEntries
+    // 归档记的是被摘要取代的消息, 上一次压缩留下的摘要不算
+    const archiveSourceBlobIds = params.plan.replacedEntries
         .filter(entry => !isSummaryBlobMessage(entry.raw))
         .map(entry => entry.blobId);
 
