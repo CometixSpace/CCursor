@@ -200,7 +200,9 @@ export class AnthropicProvider implements LLMProvider {
             type: 'done',
             stopReason: finalMessage.stop_reason ?? 'end_turn',
             usage: {
-                inputTokens: finalMessage.usage.input_tokens,
+                // Anthropic 的 input_tokens 不含缓存读写, 三者互不相交; 加起来才是整个 prompt 的规模,
+                // 与 OpenAI / Gemini 的口径 (prompt 总数, 缓存是其子集) 一致。
+                inputTokens: finalMessage.usage.input_tokens + cacheRead + cacheWrite,
                 outputTokens: finalMessage.usage.output_tokens,
                 cacheReadTokens: cacheRead || undefined,
                 cacheWriteTokens: cacheWrite || undefined,

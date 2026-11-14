@@ -43,6 +43,7 @@ export type LLMStreamEvent
 
 /** Token 用量 */
 export interface LLMUsage {
+  /** 整个 prompt 的 token 数, 缓存读写的部分也算在内 */
   inputTokens: number
   outputTokens: number
   cacheReadTokens?: number
