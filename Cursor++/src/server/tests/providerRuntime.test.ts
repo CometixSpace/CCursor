@@ -11,7 +11,7 @@ import { AgentServerMessageSchema } from '../gen/agent_v1_pb'
 import { cacheBlob, getCachedBlob, resetBlobCacheForTests, warmupBlobsAsync } from '../handlers/agent/blobStore'
 import { checkpoint, kvMessage, summary, summaryCompleted, summaryStarted } from '../handlers/agent/stream'
 import { finalizeToolCall } from '../handlers/agent/toolLifecycle'
-import { addUsage, clampTokenDetails, computeContextUsagePercent, emptyUsageTotals, estimateContextTokens, shouldTriggerCompaction } from '../handlers/agent/usage'
+import { addUsage, clampTokenDetails, computeContextUsagePercent, emptyUsageTotals, estimateContextTokens } from '../handlers/agent/usage'
 import { resolvePromptProfile } from '../handlers/llm/promptProfile'
 import { resolveProviderRuntime } from '../handlers/llm/providerRuntime'
 import { routeModel } from '../handlers/llm/router'
@@ -97,7 +97,6 @@ it('usage helpers accumulate totals and estimate context tokens for checkpointin
   expect(estimateContextTokens({ inputTokens: 1200, outputTokens: 300 })).toBe(1500)
   expect(clampTokenDetails(2500, 2000)).toEqual({ usedTokens: 2000, maxTokens: 2000 })
   expect(computeContextUsagePercent(1800, 2000)).toBe(90)
-  expect(shouldTriggerCompaction(1800, 2000)).toBe(true)
 })
 
 it('summary lifecycle builders emit Cursor-compatible interaction updates', () => {

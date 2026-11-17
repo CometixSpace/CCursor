@@ -8,14 +8,19 @@ import {
     COMPACTION_LONG_BODY_THRESHOLD,
     COMPACTION_MEDIUM_BODY_KEEP_TAIL,
     COMPACTION_MEDIUM_BODY_THRESHOLD,
+    COMPACTION_TAIL_BUDGET_RATIO,
 } from './constants';
 import type { LLMMessage } from '../llm/types';
 import type { HistoryEntry } from './historyManager';
-import { isPreambleUserMessage, isSummaryBlobMessage } from './historyManager';
+import { isPreambleUserMessage } from './historyManager';
 
 export interface CompactionPlan {
     leading: HistoryEntry[];
+    /** 交给模型写成摘要的部分 */
     summarizeEntries: HistoryEntry[];
+    /** 其中被摘要取代的那些。钉在 tail 开头的用户指令两边都在, 不算 (见 planCompaction) */
+    replacedEntries: HistoryEntry[];
+    /** 摘要之后原样保留的部分 */
     keepTail: HistoryEntry[];
 }
 
@@ -84,15 +89,43 @@ export function formatMessageForSummary(message: LLMMessage): string {
     return text ? `${message.role}:\n${text}` : '';
 }
 
+/** U+2E80 起是中日韩文字 (及其后的全角符号、谚文等) 所在的区段 */
+const CJK_START = 0x2E80;
+
+/**
+ * 拉丁文字和代码大约 4 个字符一个 token; 中日韩文字大约一个字一个 token,
+ * 一律按 ÷4 会把中文低估到实际的三分之一。
+ */
 export function estimateTextTokens(text: string): number {
-    return Math.max(1, Math.ceil(text.length / 4));
+    let wideChars = 0;
+    for (let i = 0; i < text.length; i++) {
+        if (text.charCodeAt(i) >= CJK_START) wideChars++;
+    }
+    return Math.max(1, Math.ceil(wideChars + (text.length - wideChars) / 4));
 }
 
 export function estimateMessagesTokens(messages: Array<LLMMessage | { role: string; content: string }>): number {
     return messages.reduce((sum, message) => sum + estimateTextTokens(typeof message.content === 'string' ? message.content : formatMessageForSummary(message as LLMMessage)), 0);
 }
 
-export function planCompaction(entries: HistoryEntry[]): CompactionPlan {
+function estimateEntriesTokens(entries: HistoryEntry[]): number {
+    return estimateMessagesTokens(entries.map(entry => entry.message));
+}
+
+/**
+ * tail (body 从 start 起的部分) 超出 budget 时, 把最旧的一轮 —— 一条非 tool 消息连同紧跟它的
+ * tool 结果 —— 整轮让给摘要, 直到装得下。最后一轮始终保留, 模型续写要用。返回 tail 新的起点。
+ */
+function fitTailToBudget(body: HistoryEntry[], start: number, budget: number): number {
+    while (estimateEntriesTokens(body.slice(start)) > budget) {
+        const nextRound = body.findIndex((entry, i) => i > start && entry.message.role !== 'tool');
+        if (nextRound < 0) break;
+        start = nextRound;
+    }
+    return start;
+}
+
+export function planCompaction(entries: HistoryEntry[], contextTokenLimit = 0): CompactionPlan {
     const leading: HistoryEntry[] = [];
     let index = 0;
 
@@ -125,36 +158,49 @@ export function planCompaction(entries: HistoryEntry[]): CompactionPlan {
     // 如果 keepTail 以 tool role 开头, 其配对的 assistant(tool_use) 在 summarize 侧,
     // 发给 OpenAI 时报 "No tool call found for function call output"。
     //
-    // 同理, 如果 keepTail 以 assistant(含 tool_use) 开头, 但下一条 tool(result)
-    // 被切到 summarize 侧, assistant 的 tool_use 就没有配对结果。
-    //
-    // 修复: 向前扩展 keepTail 到最近的安全边界 (user 或无 tool_use 的 assistant)。
-    while (summarizeCount > 0) {
-        const first = body[summarizeCount];
-        if (!first) break;
-        // keepTail 首条是 tool result → 配对的 tool_call 在 summarize 侧
-        if (first.message.role === 'tool') {
-            summarizeCount--;
-            continue;
-        }
-        // keepTail 首条是 assistant 且含 tool_use → 下面的 tool result 可能被切走
-        if (first.message.role === 'assistant' && hasToolUse(first.message)) {
-            summarizeCount--;
-            continue;
-        }
-        break;
-    }
+    // 退到所属的 assistant 即止: 它的 tool results 都排在它后面, 已经在 tail 里。
+    // 再往前退会把更早的工具轮次逐个拉回 tail, 长工具链里一条也压不掉。
+    while (body[summarizeCount]?.message.role === 'tool' && summarizeCount > 0)
+        summarizeCount--;
 
-    return {
-        leading,
-        summarizeEntries: body.slice(0, summarizeCount),
-        keepTail: body.slice(summarizeCount),
-    };
+    // 条数挡不住体积: 几条巨型工具结果就能让 tail 贴着触发线, 压完下一轮又触发。
+    const tailBudget = contextTokenLimit > 0 ? contextTokenLimit * COMPACTION_TAIL_BUDGET_RATIO : Infinity;
+    summarizeCount = fitTailToBudget(body, summarizeCount, tailBudget);
+
+    // 用户的指令要有原文留在压缩后的历史里: 摘要是转述, 可能走样 (官方客户端的切分同样会回溯保留它)。
+    // 长工具链里本轮的指令早已落在摘要一侧 —— tail 里有内容却没有用户消息时, 把最后一条指令的原文钉在
+    // tail 开头, 它占的体积从 tail 的预算里出。摘要一侧照样有它: 摘要要对着任务来写。
+    // 指令自己就超出预算的只靠摘要转述, 否则它永远压不掉。tail 是空的就不钉: 那条指令已经答完了。
+    const tail = body.slice(summarizeCount);
+    const lastInstruction = tail.length === 0 || tail.some(isUserInstruction)
+        ? undefined
+        : body.slice(0, summarizeCount).filter(isUserInstruction).at(-1);
+    const pinned = lastInstruction && estimateEntriesTokens([lastInstruction]) <= tailBudget ? [lastInstruction] : [];
+    summarizeCount = fitTailToBudget(body, summarizeCount, tailBudget - estimateEntriesTokens(pinned));
+
+    const summarizeEntries = body.slice(0, summarizeCount);
+    const replacedEntries = summarizeEntries.filter(entry => !pinned.includes(entry));
+
+    // 被取代的只有上一次压缩留下的摘要 (或者什么都没有) 时没有东西可压: 再调一次模型只会得到摘要的摘要。
+    if (replacedEntries.every(isSummaryEntry))
+        return { leading, summarizeEntries: [], replacedEntries: [], keepTail: body };
+
+    return { leading, summarizeEntries, replacedEntries, keepTail: [...pinned, ...body.slice(summarizeCount)] };
 }
 
-function hasToolUse(message: LLMMessage): boolean {
-    if (typeof message.content === 'string') return false;
-    return message.content.some(b => b.type === 'tool_use');
+/** 用户自己写的消息 —— 不算 tool_result 的载体, 也不算只带图片的附件消息。只看形态: 历史修复把落单的工具结果改写成的 user 文本也算。 */
+function isUserInstruction(entry: HistoryEntry): boolean {
+    const { role, content } = entry.message;
+    return role === 'user'
+        && (typeof content === 'string' ? content.trim().length > 0 : content.some(block => block.type === 'text'));
+}
+
+/** 摘要消息的固定开头。历史重新编码后 providerOptions 上的 isSummary 标记会丢, 只有内容还认得出来。 */
+const SUMMARY_MESSAGE_PREFIX = 'Previous conversation summary:\n';
+
+function isSummaryEntry(entry: HistoryEntry): boolean {
+    const { role, content } = entry.message;
+    return role === 'assistant' && typeof content === 'string' && content.startsWith(SUMMARY_MESSAGE_PREFIX);
 }
 
 function encodeBinaryBlob(bytes: Uint8Array): { blobId: string; blobData: string; blobDataRaw: Uint8Array } {
@@ -170,13 +216,14 @@ export function createCompactionArtifacts(params: {
 }): CompactionArtifacts {
     const summaryBlob = encodeBlob({
         role: 'assistant',
-        content: `Previous conversation summary:\n${params.summaryText}`,
+        content: `${SUMMARY_MESSAGE_PREFIX}${params.summaryText}`,
         providerOptions: { cursor: { isSummary: true } },
     });
     cacheBlob(summaryBlob.blobId, summaryBlob.blobData);
 
-    const archiveSourceBlobIds = params.plan.summarizeEntries
-        .filter(entry => !isSummaryBlobMessage(entry.raw))
+    // 归档记的是被摘要取代的消息, 上一次压缩留下的摘要不算
+    const archiveSourceBlobIds = params.plan.replacedEntries
+        .filter(entry => !isSummaryEntry(entry))
         .map(entry => entry.blobId);
 
     const archiveBlobs: Array<{ blobId: string; blobData: string; blobDataRaw?: Uint8Array }> = [];

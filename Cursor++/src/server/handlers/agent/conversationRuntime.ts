@@ -22,7 +22,7 @@ import { restoreBlobMessageToLLMMessage } from './transcript'
 import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, readTurnBaseline } from './turnTracker'
 import { contextualizeDynamicMetaTools, partitionCursorBuiltinTools, shouldEnableBuiltinDynamicProfile } from './dynamicTools'
 import { contextualizeSubagentTools } from './subagentCatalog'
-import { addUsage, clampTokenDetails, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold, shouldTriggerCompaction } from './usage'
+import { addUsage, clampTokenDetails, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold } from './usage'
 import { isAgentRunAbortedError, throwIfSessionCancelled } from './wait'
 import { isSessionCancelled } from './session'
 import { makeProviderError, makeToolError } from '../errors'
@@ -531,7 +531,7 @@ async function* performInlineAutoSummarize(params: {
   if (historyEntries.length === 0)
     return null
 
-  const compactionPlan = planCompaction(historyEntries)
+  const compactionPlan = planCompaction(historyEntries, contextTokenLimit)
   if (compactionPlan.summarizeEntries.length === 0) {
     logger.info({ conversationId: parsed.conversationId }, '[AGENT] auto-summarize: nothing to compact')
     return null
@@ -1152,7 +1152,10 @@ export async function* handleConversationRun(
               currentText,
             }))
             Object.assign(usageTotals, addUsage(usageTotals, event.usage))
-            usedTokensEstimate = Math.max(usedTokensEstimate, estimateContextTokens(event.usage))
+            // 模型上报的是这一轮的真实占用, 有就以它为准 —— 之前的估算偏高时也由它拉回来。
+            // 有的中转不回传 usage (全是 0), 那就保留已有的估算。
+            if (event.usage.inputTokens > 0)
+              usedTokensEstimate = estimateContextTokens(event.usage)
             break
         }
       }, undefined, (event) => {
@@ -1222,6 +1225,7 @@ export async function* handleConversationRun(
 
       const roundContext = route.createRoundContext()
       const roundImageBlocks: LLMContentBlock[] = []
+      const messageCountBeforeTools = messages.length
 
       // ── Phase 1: 批量发送 Task tool 的 started + exec（不等待结果） ──
       const taskLaunches: TaskLaunchContext[] = []
@@ -1349,7 +1353,10 @@ export async function* handleConversationRun(
         blobIds,
       ))
 
-      usedTokensEstimate = Math.max(usedTokensEstimate, estimateMessagesTokens(messages))
+      // 模型上报的用量不含这一轮新进来的工具结果, 叠加上去 (assistant 那条已经算在上报的输出里)。
+      // 只和全部消息的估算取较大者是不够的: 后者不含工具定义, 往往更小, 等于没加。
+      const toolResults = messages.slice(messageCountBeforeTools).filter(message => message.role !== 'assistant')
+      usedTokensEstimate = Math.max(usedTokensEstimate + estimateMessagesTokens(toolResults), estimateMessagesTokens(messages))
 
       const allBlobIdsForCheckpoint = [...parsed.historyBlobIds, ...blobIds]
       const materializedTurnBlob = activeTurn?.materializeTurnBlob()
@@ -1377,14 +1384,16 @@ export async function* handleConversationRun(
       // 链路①: 服务端 Agent Run 内自动 summarize
       // 每轮都检查——超阈值就触发 compaction,可重复触发,连续失败 3 次才熔断
       // (对齐 Claude Code autoCompactIfNeeded 的 consecutiveFailures 熔断机制)
+      // 输出预留按模型实际的 maxOutputTokens 算: 它会原样作为 max_tokens 发给 provider
+      const autoCompactThreshold = getAutoCompactThreshold(contextTokenLimit, route.maxOutputTokens)
       if (autoCompactConsecutiveFailures < MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES
-        && shouldTriggerCompaction(usedTokensEstimate, contextTokenLimit)) {
+        && usedTokensEstimate >= autoCompactThreshold) {
         logger.info({
           conversationId: parsed.conversationId,
           round,
           usedTokensEstimate,
           contextTokenLimit,
-          threshold: getAutoCompactThreshold(contextTokenLimit),
+          threshold: autoCompactThreshold,
           consecutiveFailures: autoCompactConsecutiveFailures,
         }, '[AGENT] auto-summarize: threshold exceeded, triggering inline compaction')
 

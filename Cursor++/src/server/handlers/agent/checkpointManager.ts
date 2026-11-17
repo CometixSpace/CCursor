@@ -1,6 +1,6 @@
 import type { AgentServerMessage } from '../../gen/agent_v1_pb';
 import { checkpoint } from './stream';
-import { clampTokenDetails, computeContextUsagePercent, shouldTriggerCompaction, type UsageTotals } from './usage';
+import { clampTokenDetails, computeContextUsagePercent, type UsageTotals } from './usage';
 import { summarizeAssistantContent } from './transcript';
 import { persistConversationCheckpoint } from '../../database/checkpoints';
 import type { LLMContentBlock } from '../llm/types';
@@ -41,10 +41,6 @@ export function emitRollingCheckpoint(params: {
         nextBlobbedMessageIndex: params.nextBlobbedMessageIndex,
         rollingTokenDetails,
         rollingContextUsagePercent,
-        shouldTriggerCompaction: shouldTriggerCompaction(
-            rollingTokenDetails.usedTokens,
-            rollingTokenDetails.maxTokens,
-        ),
         usageTotals: params.usageTotals,
     }, '[SESSION] round checkpoint update');
 
@@ -109,7 +105,6 @@ export function emitFinalCheckpoint(params: {
         textLen: assistantSummary.text?.length ?? 0,
         tokenDetails,
         contextUsagePercent,
-        shouldTriggerCompaction: shouldTriggerCompaction(tokenDetails.usedTokens, tokenDetails.maxTokens),
         usageTotals: params.usageTotals,
     }, '[SESSION] checkpoint assistant content');
 
