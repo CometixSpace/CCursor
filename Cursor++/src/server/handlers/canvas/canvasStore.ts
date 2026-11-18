@@ -37,6 +37,19 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
+/**
+ * 把一段 JSON 文本嵌进内联 <script> 前必须做的转义。
+ *
+ * HTML 解析器在遇到 `</script` 时就结束脚本块,不管它出现在 JS 字符串字面量里。
+ * canvas 的 data.json 是用户/模型产出的内容,只要任意字符串值里含 `</script>`
+ * (或 `<!--`),导出的单文件 HTML 就会被截断,后半段作为 DOM 解析。
+ *
+ * JSON 里 `<` 只可能出现在字符串字面量内部,换成 `\u003c` 语义完全等价。
+ */
+function escapeJsonForInlineScript(json: string): string {
+  return json.replace(/</g, '\\u003c')
+}
+
 export interface CanvasMeta {
   shareId: string
   title: string
@@ -126,7 +139,7 @@ function buildSingleFileHtml(title: string, bundleBase64: string, dataJson: stri
 <script>
   window.__cursorCanvas = {
     canvasId: "exported",
-    data: new Map(Object.entries(${dataJson || '{}'})),
+    data: new Map(Object.entries(${escapeJsonForInlineScript(dataJson || '{}')})),
     state: new Map([["theme", { kind: "light" }]]),
   };
 </script>
