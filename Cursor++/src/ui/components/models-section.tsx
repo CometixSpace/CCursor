@@ -14,7 +14,8 @@ export function ModelsSection() {
       <div class="models-header">
         <span
           class="models-title"
-          {...{ 'x-text': '\'Models (\' + ($store.app.getDraft(p.id).models || []).length + \')\'' }}
+          title="Enabled / total models"
+          {...{ 'x-text': '\'Models (\' + $store.app.modelCountLabel(p.id) + \')\'' }}
         >
         </span>
         <span class="models-header-actions">

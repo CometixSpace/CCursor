@@ -10,7 +10,7 @@ export function ProviderAccordion() {
         <span class="acc-caret" {...{ 'x-text': '$store.app.expanded[p.id] ? \'▼\' : \'▶\'' }}></span>
         <span class="acc-title" {...{ 'x-text': '$store.app.getDraftOrOriginal(p.id).name || \'(unnamed)\'' }}></span>
         <span class="acc-type" {...{ 'x-text': '$store.app.getDraftOrOriginal(p.id).type' }}></span>
-        <span class="acc-meta" {...{ 'x-text': '($store.app.getDraftOrOriginal(p.id).models || []).length + \' model\' + (($store.app.getDraftOrOriginal(p.id).models || []).length === 1 ? \'\' : \'s\')' }}></span>
+        <span class="acc-meta" title="Enabled / total models" {...{ 'x-text': '$store.app.modelCountLabel(p.id) + \' models\'' }}></span>
         <span class="acc-dot" title="Unsaved changes" {...{ 'x-show': '$store.app.isDirty(p.id)' }}></span>
         <span class="acc-sort" {...{ 'x-on:click.stop': '' }}>
           <button class="sort-btn" title="Move up" {...{ 'x-on:click': '$store.app.moveProvider(p.id, -1)' }} {...{ 'x-show': 'pIdx > 0' }}>&#9650;</button>
